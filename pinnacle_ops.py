@@ -75,7 +75,7 @@ SPECIAL_SOLO_ACTIVITY_NAMES = {
     1221538367: "Operation: Seraph's Shield (Standard)",
     995051012: "Operation: Seraph's Shield (Legend)",
     2919809209: "Operation: Seraph's Shield (Expert)",
-    3645820853: "Ultimate Conquest - Operation: Seraph's Shield (Customize)",
+    3645820853: "Operation: Seraph's Shield (Customize)",
 
     # The Coil
     962366573: "The Coil (Customize)",
@@ -164,17 +164,18 @@ def normalize_special_solo_activity_display_name(name: str | None):
         return value
 
     # Normalize Bungie variant labels to a cleaner public naming scheme.
-    # Standard/Customize -> Normal, Expert/Legend -> Master.
-    value = re.sub(r":\s*Customize\b", " (Normal)", value, flags=re.IGNORECASE)
-    value = re.sub(r":\s*Standard\b", " (Normal)", value, flags=re.IGNORECASE)
-    value = re.sub(r"\(Standard\)", "(Normal)", value, flags=re.IGNORECASE)
-    value = re.sub(r"\(Customize\)", "(Normal)", value, flags=re.IGNORECASE)
+    # Standard/Normal/Customize -> Customize, Expert/Legend -> Master.
+    value = re.sub(r":\s*Customize\b", " (Customize)", value, flags=re.IGNORECASE)
+    value = re.sub(r":\s*Standard\b", " (Customize)", value, flags=re.IGNORECASE)
+    value = re.sub(r"\(Standard\)", "(Customize)", value, flags=re.IGNORECASE)
+    value = re.sub(r"\(Customize\)", "(Customize)", value, flags=re.IGNORECASE)
+    value = re.sub(r"\(Normal\)", "(Customize)", value, flags=re.IGNORECASE)
     value = re.sub(r"\(Legend\)", "(Master)", value, flags=re.IGNORECASE)
     value = re.sub(r"\(Expert\)", "(Master)", value, flags=re.IGNORECASE)
 
     # Keep labels consistent when Bungie omits an explicit variant for exotic missions.
     if value.casefold().startswith("exotic mission - ") and "(" not in value:
-        value = f"{value} (Normal)"
+        value = f"{value} (Customize)"
 
     # Some manifest labels omit the "Exotic Mission -" prefix entirely
     # (for example "Kell's Fall: Customize"). Keep embed titles consistent.

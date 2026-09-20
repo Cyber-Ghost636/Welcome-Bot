@@ -93,6 +93,17 @@ def format_int_stat(value):
         return None
 
 
+def should_hide_status_for_short_exotic_run(activity_name: str | None, duration_seconds) -> bool:
+    name_text = str(activity_name or "").casefold().strip()
+    if not name_text.startswith("exotic mission -"):
+        return False
+    try:
+        duration_value = int(duration_seconds)
+    except (TypeError, ValueError):
+        return False
+    return duration_value < 10 * 60
+
+
 def load_rules_config():
     if CONFIG_FILE.exists():
         try:
@@ -1324,14 +1335,16 @@ async def post_solo_completion(guild: discord.Guild, channel_id: str, player, co
     deaths_value = completion.get("deaths")
     duration_text = format_duration(duration_seconds)
 
-    status = "Complete" if was_started_from_beginning else "Checkpoint"
+    status = "Full" if was_started_from_beginning else "Checkpoint"
     kills_text = format_int_stat(kills_value) or "—"
     deaths_text = format_int_stat(deaths_value) or "—"
     time_text = duration_text or "—"
+    hide_status = should_hide_status_for_short_exotic_run(dungeon_name, duration_seconds)
     embed.add_field(name="Kills", value=kills_text, inline=True)
     embed.add_field(name="Deaths", value=deaths_text, inline=True)
     embed.add_field(name="Time", value=time_text, inline=True)
-    embed.add_field(name="Status", value=status, inline=True)
+    if not hide_status:
+        embed.add_field(name="Status", value=status, inline=True)
 
     await channel.send(embed=embed)
     solo_debug(
@@ -2451,11 +2464,13 @@ async def post_latest_solo_embed(
     kills_text = format_int_stat(completion.get("kills")) or "—"
     deaths_text = format_int_stat(completion.get("deaths")) or "—"
     time_text = format_duration(completion.get("duration_seconds")) or "—"
-    status_text = "Checkpoint" if checkpoint else "Complete"
+    status_text = "Checkpoint" if checkpoint else "Full"
+    hide_status = should_hide_status_for_short_exotic_run(dungeon_name, completion.get("duration_seconds"))
     embed.add_field(name="Kills", value=kills_text, inline=True)
     embed.add_field(name="Deaths", value=deaths_text, inline=True)
     embed.add_field(name="Time", value=time_text, inline=True)
-    embed.add_field(name="Status", value=status_text, inline=True)
+    if not hide_status:
+        embed.add_field(name="Status", value=status_text, inline=True)
 
     gold_cup_path = BASE_DIR / "Gold-Cup.png"
     if gold_cup_path.exists():

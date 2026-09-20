@@ -200,6 +200,17 @@ def resolve_dungeon_image_by_name(dungeon_name: str, guild_config):
     return fallback_text or None
 
 
+def should_hide_status_for_short_exotic_run(activity_name: str | None, duration_seconds) -> bool:
+    name_text = str(activity_name or "").casefold().strip()
+    if not name_text.startswith("exotic mission -"):
+        return False
+    try:
+        duration_value = int(duration_seconds)
+    except (TypeError, ValueError):
+        return False
+    return duration_value < 10 * 60
+
+
 def parse_bungie_profile_input(value: str):
     if not value:
         return None
@@ -527,8 +538,10 @@ async def post_solo_completion(guild: discord.Guild, channel_id: str, player, co
     embed.add_field(name="Kills", value=format_int_stat(completion.get("kills")) or "-", inline=True)
     embed.add_field(name="Deaths", value=format_int_stat(completion.get("deaths")) or "-", inline=True)
     embed.add_field(name="Time", value=format_duration(completion.get("duration_seconds")) or "-", inline=True)
-    status = "Complete" if completion.get("was_started_from_beginning", True) else "Checkpoint"
-    embed.add_field(name="Status", value=status, inline=True)
+    status = "Full" if completion.get("was_started_from_beginning", True) else "Checkpoint"
+    hide_status = should_hide_status_for_short_exotic_run(dungeon_name, completion.get("duration_seconds"))
+    if not hide_status:
+        embed.add_field(name="Status", value=status, inline=True)
 
     await channel.send(embed=embed)
 
