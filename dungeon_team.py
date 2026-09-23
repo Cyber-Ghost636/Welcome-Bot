@@ -97,6 +97,27 @@ class TeamDungeonTracker:
             return "Guardian"
         return re.sub(r"#\d{1,6}$", "", str(player_name)).strip() or "Guardian"
 
+    def _is_placeholder_player_name(self, player_name):
+        if player_name is None:
+            return True
+        return str(player_name).strip().casefold() in {"", "guardian"}
+
+    def _display_name_from_profile(self, profile):
+        profile_data = (profile.get("profile", {}) or {}).get("data", {}) or {}
+        user_info = profile_data.get("userInfo") or profile_data.get("userInfoCard") or {}
+        display_name = user_info.get("bungieGlobalDisplayName") or user_info.get("displayName")
+        if not display_name:
+            return None
+
+        display_code = user_info.get("bungieGlobalDisplayNameCode")
+        if display_code is None:
+            return str(display_name)
+
+        code_int = self._safe_int(display_code)
+        if code_int is None:
+            return f"{display_name}#{display_code}"
+        return f"{display_name}#{code_int:04d}"
+
     def _resolve_class_icon(self, player, guild_config):
         guild_config = guild_config or {}
         icon_map = guild_config.get("team_dungeon_class_icon_by_name") or {}
@@ -478,6 +499,11 @@ class TeamDungeonTracker:
 
             if profile is None:
                 continue
+
+            if self._is_placeholder_player_name(player.get("name")):
+                resolved_name = self._display_name_from_profile(profile)
+                if resolved_name:
+                    player["name"] = resolved_name
 
             characters = ((profile.get("characters", {}) or {}).get("data", {}) or {})
             character = None

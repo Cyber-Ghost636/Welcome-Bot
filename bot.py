@@ -130,44 +130,29 @@ raid_role_manager = RaidRoleManager(bot, rules_config, save_rules_config)
 
 RULES_TEXT = "Please read the Rules and tap here to show you have agreed to them"
 RULES_EMOJI = "📜"
-
-
-WELCOME_GUILD_OVERRIDES = {
-    "1546957591068934294": {
-        "welcome_title": "Welcome to Seal Team Six Gaming™",
-        "welcome_message": (
-            "Welcome, {member}, to Seal Team Six Gaming™.\n"
-            "Expect chaos, cracked plays, and questionable life choices. Grab a drink, squad up, and dive in."
-        ),
-        "welcome_bottom_logo_url": "https://i.postimg.cc/bwnpKqhr/Seal-Team-Six-Gaming.jpg",
-    },
-    "738885128385855498": {
-        "welcome_title": "Welcome to Seal Team Six Gaming™",
-        "welcome_message": (
-            "Welcome, {member}, to Seal Team Six Gaming™.\n"
-            "Expect chaos, cracked plays, and questionable life choices. Grab a drink, squad up, and dive in."
-        ),
-        "welcome_bottom_logo_url": "https://i.postimg.cc/bwnpKqhr/Seal-Team-Six-Gaming.jpg",
-    },
-}
-
-SEAL_TEAM_SIX_MAIN_GUILD_ID = "738885128385855498"
-SEAL_TEAM_SIX_TEST_GUILD_ID = "1546957591068934294"
 GOLDEN_OLDIES_GUILD_ID = "1334068759656398899"
-SEAL_TEAM_SIX_GUILD_IDS = {
-    SEAL_TEAM_SIX_MAIN_GUILD_ID,
-    SEAL_TEAM_SIX_TEST_GUILD_ID,
-    GOLDEN_OLDIES_GUILD_ID,
-}
-SHARED_WELCOME_FIELD_KEYS = (
-    "welcome_title",
-    "welcome_message",
-    "welcome_image",
-    "welcome_bottom_logo_url",
-    "welcome_footer_logo_url",
-)
 
-SEAL_TEAM_SIX_TEST_WELCOME_CHANNEL_ID = "1546958740689911938"
+
+def _parse_allowed_guild_ids(raw_value: str | None):
+    if not raw_value:
+        return set()
+    parts = [part.strip() for part in str(raw_value).split(",")]
+    return {part for part in parts if part.isdigit()}
+
+
+ALLOWED_GUILD_IDS = _parse_allowed_guild_ids(os.getenv("BOT_ALLOWED_GUILD_IDS"))
+
+
+def is_allowed_guild_id(guild_id: int | str | None):
+    if not ALLOWED_GUILD_IDS:
+        return True
+    if guild_id is None:
+        return False
+    return str(guild_id) in ALLOWED_GUILD_IDS
+
+
+def iter_allowed_guilds():
+    return [guild for guild in bot.guilds if is_allowed_guild_id(guild.id)]
 
 
 def get_effective_welcome_settings(
@@ -176,40 +161,25 @@ def get_effective_welcome_settings(
     guild_name: str | None = None,
     current_channel_id: int | None = None,
 ):
-    guild_id_str = str(guild_id or "")
-    effective_config = dict(guild_config or {})
+    return dict(guild_config or {})
 
-    # Keep Seal Team Six test server in sync with the main Seal Team Six setup.
-    if guild_id_str == SEAL_TEAM_SIX_TEST_GUILD_ID:
-        source_config = rules_config.get(SEAL_TEAM_SIX_MAIN_GUILD_ID, {})
-        if isinstance(source_config, dict):
-            for key in SHARED_WELCOME_FIELD_KEYS:
-                value = source_config.get(key)
-                if value:
-                    effective_config[key] = value
 
-    override = WELCOME_GUILD_OVERRIDES.get(guild_id_str)
-    if override is None and guild_name:
-        normalized_name = str(guild_name).casefold()
-        if (
-            "seal team six" in normalized_name
-            or "team six" in normalized_name
-            or "team 6" in normalized_name
-        ):
-            override = WELCOME_GUILD_OVERRIDES.get("1546957591068934294")
-    if override is None:
-        configured_welcome_channel_id = str(effective_config.get("welcome_channel_id") or "").strip()
-        if configured_welcome_channel_id == SEAL_TEAM_SIX_TEST_WELCOME_CHANNEL_ID:
-            override = WELCOME_GUILD_OVERRIDES.get("1546957591068934294")
-    if override is None and current_channel_id is not None:
-        if str(current_channel_id) == SEAL_TEAM_SIX_TEST_WELCOME_CHANNEL_ID:
-            override = WELCOME_GUILD_OVERRIDES.get("1546957591068934294")
-    if override:
-        # Override map is fallback only; explicit config values stay authoritative.
-        for key, value in override.items():
-            effective_config.setdefault(key, value)
+def resolve_welcome_image_url(guild_config):
+    config = guild_config or {}
+    welcome_image = config.get("welcome_image")
+    if welcome_image:
+        return str(welcome_image)
 
-    return effective_config
+    # Backward-compatible fallback for guilds using /set_welcome_logo.
+    welcome_bottom_logo_url = config.get("welcome_bottom_logo_url")
+    if welcome_bottom_logo_url:
+        return str(welcome_bottom_logo_url)
+
+    welcome_footer_logo_url = config.get("welcome_footer_logo_url")
+    if welcome_footer_logo_url:
+        return str(welcome_footer_logo_url)
+
+    return None
 
 
 async def build_embed_image_attachment(image_url: str | None, fallback_name: str = "welcome-image"):
@@ -230,34 +200,6 @@ async def build_embed_image_attachment(image_url: str | None, fallback_name: str
         return None, None
 
     return discord.File(io.BytesIO(data), filename=filename), filename
-
-
-def is_seal_team_six_welcome_context(
-    guild_id: int | None,
-    guild_name: str | None,
-    guild_config,
-    current_channel_id: int | None = None,
-):
-    guild_id_str = str(guild_id or "")
-    if guild_id_str in {SEAL_TEAM_SIX_MAIN_GUILD_ID, SEAL_TEAM_SIX_TEST_GUILD_ID}:
-        return True
-
-    normalized_name = str(guild_name or "").casefold()
-    if (
-        "seal team six" in normalized_name
-        or "team six" in normalized_name
-        or "team 6" in normalized_name
-    ):
-        return True
-
-    configured_welcome_channel_id = str((guild_config or {}).get("welcome_channel_id") or "").strip()
-    if configured_welcome_channel_id == SEAL_TEAM_SIX_TEST_WELCOME_CHANNEL_ID:
-        return True
-
-    if current_channel_id is not None and str(current_channel_id) == SEAL_TEAM_SIX_TEST_WELCOME_CHANNEL_ID:
-        return True
-
-    return False
 
 
 DUNGEON_NAMES = {
@@ -1545,7 +1487,7 @@ async def post_solo_completion(guild: discord.Guild, channel_id: str, player, co
 
 async def run_solo_check_for_guild(guild: discord.Guild):
     # Solo completion posts are intentionally restricted to Golden Oldies.
-    if str(guild.id) != GOLDEN_OLDIES_GUILD_ID:
+    if str(guild.id) != "1334068759656398899":
         return
 
     guild_config = get_guild_config(guild.id)
@@ -1811,7 +1753,7 @@ async def run_startup_solo_scan_once():
     if startup_solo_scan_done:
         return
 
-    for guild in bot.guilds:
+    for guild in iter_allowed_guilds():
         try:
             await run_solo_check_for_guild(guild)
         except Exception as e:
@@ -1824,8 +1766,9 @@ async def run_startup_solo_scan_once():
 async def solo_dungeon_check_loop():
     if bungie_api is None:
         return
-    print(f"[SOLO_LOOP] Starting cycle for {len(bot.guilds)} guild(s)", flush=True)
-    for guild in bot.guilds:
+    active_guilds = iter_allowed_guilds()
+    print(f"[SOLO_LOOP] Starting cycle for {len(active_guilds)} guild(s)", flush=True)
+    for guild in active_guilds:
         try:
             await run_solo_check_for_guild(guild)
         except Exception as e:
@@ -1842,7 +1785,7 @@ async def before_solo_dungeon_check_loop():
 async def team_activity_check_loop():
     if bungie_api is None:
         return
-    for guild in bot.guilds:
+    for guild in iter_allowed_guilds():
         await run_team_activity_check_for_guild(guild)
 
 
@@ -1965,6 +1908,9 @@ async def on_ready():
     global startup_solo_scan_task
     print(f'Logged in as {bot.user}!', flush=True)
 
+    if ALLOWED_GUILD_IDS:
+        print(f"Guild isolation enabled: {sorted(ALLOWED_GUILD_IDS)}", flush=True)
+
     if BOT_USERNAME and bot.user and bot.user.name != BOT_USERNAME:
         try:
             await bot.user.edit(username=BOT_NICKNAME)
@@ -1973,7 +1919,7 @@ async def on_ready():
             print(f"Failed to update global bot username: {e}", flush=True)
 
     if BOT_NICKNAME:
-        for guild in bot.guilds:
+        for guild in iter_allowed_guilds():
             me = guild.me or guild.get_member(bot.user.id)
             if me is None:
                 try:
@@ -2005,7 +1951,7 @@ async def on_ready():
         print(f'Synced {len(synced)} global command(s)')
 
         # Remove any old guild-scoped copies so Discord only shows one command set.
-        for guild in bot.guilds:
+        for guild in iter_allowed_guilds():
             bot.tree.clear_commands(guild=guild)
             guild_synced = await asyncio.wait_for(bot.tree.sync(guild=guild), timeout=20)
             print(
@@ -2025,7 +1971,7 @@ async def on_ready():
                         await bot.http.delete_global_command(app_id, int(command.id))
                         print(f"Removed stale global command: {command.name}")
 
-                for guild in bot.guilds:
+                for guild in iter_allowed_guilds():
                     guild_commands = await bot.tree.fetch_commands(guild=guild)
                     for command in guild_commands:
                         if str(getattr(command, "name", "")) in stale_command_names:
@@ -2068,7 +2014,7 @@ async def on_ready():
         except Exception as e:
             print(f"Failed to resolve RULES_CHANNEL_ID: {e}")
 
-    for guild in bot.guilds:
+    for guild in iter_allowed_guilds():
         guild_key = str(guild.id)
         guild_config = rules_config.get(guild_key, {})
         channel_id = guild_config.get("rules_channel_id")
@@ -2099,6 +2045,9 @@ async def on_close():
 
 @bot.event
 async def on_member_join(member):
+    if not is_allowed_guild_id(member.guild.id):
+        return
+
     guild_config = rules_config.get(str(member.guild.id), {})
     guild_config = get_effective_welcome_settings(member.guild.id, guild_config, member.guild.name)
     if guild_config.get("welcome_enabled", True) is False:
@@ -2119,29 +2068,13 @@ async def on_member_join(member):
             "{member} has joined the server!\n\nSay hi, and introduce yourself in General Chat!"
         )
         welcome_image = guild_config.get("welcome_image")
-        welcome_bottom_logo_url = guild_config.get("welcome_bottom_logo_url")
-        welcome_footer_logo_url = guild_config.get("welcome_footer_logo_url")
-        if not welcome_bottom_logo_url and welcome_footer_logo_url:
-            welcome_bottom_logo_url = welcome_footer_logo_url
-        prefer_bottom_logo = is_seal_team_six_welcome_context(
-            member.guild.id,
-            member.guild.name,
-            guild_config,
-            getattr(channel, "id", None),
-        )
         embed = discord.Embed(
             title=welcome_title,
             description=welcome_message.replace("{member}", member.mention),
             color=discord.Color.gold()
         )
         embed.set_thumbnail(url=member.display_avatar.url)
-        image_url = None
-        if prefer_bottom_logo and welcome_bottom_logo_url:
-            image_url = str(welcome_bottom_logo_url)
-        elif welcome_image:
-            image_url = str(welcome_image)
-        elif welcome_bottom_logo_url:
-            image_url = str(welcome_bottom_logo_url)
+        image_url = resolve_welcome_image_url(guild_config)
 
         attachment, filename = await build_embed_image_attachment(image_url, fallback_name="welcome-logo")
         if attachment and filename:
@@ -2156,6 +2089,8 @@ async def on_member_join(member):
 @bot.event
 async def on_raw_reaction_add(payload):
     if payload.guild_id is None:
+        return
+    if not is_allowed_guild_id(payload.guild_id):
         return
 
     guild_rules = rules_config.get(str(payload.guild_id), {})
@@ -2212,9 +2147,16 @@ async def on_raw_reaction_add(payload):
 async def on_raw_reaction_remove(payload):
     if payload.guild_id is None:
         return
+    if not is_allowed_guild_id(payload.guild_id):
+        return
 
     guild_rules = rules_config.get(str(payload.guild_id), {})
     await raid_role_manager.handle_raid_reaction_remove(payload, guild_rules)
+
+
+@bot.tree.check
+async def guild_scope_check(interaction: discord.Interaction):
+    return is_allowed_guild_id(interaction.guild_id)
 
 
 @bot.tree.command(name="test_welcome", description="Test the welcome embed in the current channel.")
@@ -2237,24 +2179,7 @@ async def test_welcome(interaction: discord.Interaction):
         color=discord.Color.gold()
     )
     embed.set_thumbnail(url=member.display_avatar.url)
-    welcome_image = guild_config.get("welcome_image")
-    welcome_bottom_logo_url = guild_config.get("welcome_bottom_logo_url")
-    welcome_footer_logo_url = guild_config.get("welcome_footer_logo_url")
-    if not welcome_bottom_logo_url and welcome_footer_logo_url:
-        welcome_bottom_logo_url = welcome_footer_logo_url
-    prefer_bottom_logo = is_seal_team_six_welcome_context(
-        interaction.guild_id,
-        interaction.guild.name if interaction.guild else None,
-        guild_config,
-        interaction.channel_id,
-    )
-    image_url = None
-    if prefer_bottom_logo and welcome_bottom_logo_url:
-        image_url = str(welcome_bottom_logo_url)
-    elif welcome_image:
-        image_url = str(welcome_image)
-    elif welcome_bottom_logo_url:
-        image_url = str(welcome_bottom_logo_url)
+    image_url = resolve_welcome_image_url(guild_config)
 
     attachment, filename = await build_embed_image_attachment(image_url, fallback_name="welcome-logo")
     if attachment and filename:
@@ -3049,6 +2974,8 @@ async def post_dungeon_embed(
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.errors.MissingPermissions):
         message = "You need the 'Administrator' permission to use this command."
+    elif isinstance(error, app_commands.errors.CheckFailure):
+        message = "This bot instance is not configured for this server."
     else:
         message = "Something went wrong while running that command. Please try again."
         print(f"App command error: {error}")

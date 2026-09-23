@@ -10,7 +10,7 @@ A simple Discord bot that welcomes new members to your Destiny 2 clan server.
 This repo runs two Discord bots as separate services:
 
 - `welcome-bot` service: main community bot (`bot.py`) for welcome/rules/roles and broader clan features.
-- `sts-solo-bot` service: D2 Solo bot (`sts_bot.py`) for solo/flawless dungeon announcements in allowed Seal Team Six servers.
+- `sts-solo-bot` service: D2 Solo bot (`sts_solo_bot/main.py`, launched as `python -m sts_solo_bot.main`) for solo/flawless dungeon announcements in allowed Seal Team Six servers.
 
 Quick troubleshooting guide:
 

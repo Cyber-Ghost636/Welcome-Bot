@@ -4,7 +4,7 @@ This is a separate D2 Solo bot process for Seal Team Six solo/flawless dungeon p
 
 ## Files
 
-- Entry point: sts_bot.py
+- Entry point: sts_solo_bot/main.py (run as module)
 - Package: sts_solo_bot/
 - Config data: sts_server_config.json
 
@@ -25,7 +25,7 @@ Fallback token:
 ```bash
 cd /home/wh33ls/Documents/Welcome\ Bot
 source .venv/bin/activate
-python sts_bot.py
+python -m sts_solo_bot.main
 ```
 
 ## Install As Service

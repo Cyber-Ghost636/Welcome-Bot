@@ -29,7 +29,7 @@ Wants=network-online.target
 Type=simple
 User=${RUN_USER}
 WorkingDirectory=${CANONICAL_REPO}
-ExecStart=${PYTHON_BIN} ${CANONICAL_REPO}/sts_bot.py
+ExecStart=${PYTHON_BIN} -m sts_solo_bot.main
 Restart=always
 RestartSec=5
 
