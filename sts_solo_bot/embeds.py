@@ -32,7 +32,7 @@ def build_solo_embed(
     is_exotic_mission = str(dungeon_name or "").casefold().startswith("exotic mission -")
     color = discord.Color.gold() if is_flawless else discord.Color.orange()
     if is_flawless:
-        description = f"Flawless solo by {player_name}! No deaths, no mercy."
+        description = f"Flawless solo by {player_name}! Stuffed the boss in a locker and walked out flawless."
     else:
         if is_exotic_mission:
             description = f"{player_name} finished the exotic mission with some scars, but got it done."

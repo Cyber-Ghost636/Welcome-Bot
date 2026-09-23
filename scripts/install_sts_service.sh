@@ -2,16 +2,40 @@
 set -euo pipefail
 
 SERVICE_NAME="sts-solo-bot"
-SOURCE_UNIT="/home/wh33ls/welcome-bot/scripts/${SERVICE_NAME}.service"
 TARGET_UNIT="/etc/systemd/system/${SERVICE_NAME}.service"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+RUN_USER="$(id -un)"
+CANONICAL_REPO="/home/${RUN_USER}/welcome-bot"
+PYTHON_BIN="${CANONICAL_REPO}/.venv/bin/python"
 
-if [[ ! -f "${SOURCE_UNIT}" ]]; then
-  echo "Unit template not found: ${SOURCE_UNIT}" >&2
+# systemd ExecStart parsing is strict; use a symlink path without spaces.
+ln -sfn "${REPO_ROOT}" "${CANONICAL_REPO}"
+
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+  echo "Python executable not found: ${PYTHON_BIN}" >&2
+  echo "Expected virtual environment at: ${CANONICAL_REPO}/.venv" >&2
   exit 1
 fi
 
 echo "Installing ${SERVICE_NAME}.service to /etc/systemd/system"
-sudo cp "${SOURCE_UNIT}" "${TARGET_UNIT}"
+sudo tee "${TARGET_UNIT}" >/dev/null <<EOF
+[Unit]
+Description=D2 Solo Discord Bot Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${RUN_USER}
+WorkingDirectory=${CANONICAL_REPO}
+ExecStart=${PYTHON_BIN} ${CANONICAL_REPO}/sts_bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
 
 # Ensure systemd picks up the new unit.
 sudo systemctl daemon-reload

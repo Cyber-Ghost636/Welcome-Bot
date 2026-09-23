@@ -23,7 +23,7 @@ Fallback token:
 ## Run Manually
 
 ```bash
-cd /home/wh33ls/welcome-bot
+cd /home/wh33ls/Documents/Welcome\ Bot
 source .venv/bin/activate
 python sts_bot.py
 ```
@@ -31,7 +31,7 @@ python sts_bot.py
 ## Install As Service
 
 ```bash
-cd /home/wh33ls/welcome-bot
+cd /home/wh33ls/Documents/Welcome\ Bot
 chmod +x scripts/install_sts_service.sh
 ./scripts/install_sts_service.sh
 ```
@@ -70,10 +70,10 @@ journalctl -u sts-solo-bot.service --since '2 minutes ago' --no-pager | tail -n 
 Confirm the service code path maps to this workspace:
 
 ```bash
-ls -la /home/wh33ls/welcome-bot
+ls -la /home/wh33ls/Documents/Welcome\ Bot
 ```
 
-Expected result: `/home/wh33ls/welcome-bot` is a symlink to `/home/wh33ls/Documents/Welcome Bot`.
+Expected result: the project files are present at `/home/wh33ls/Documents/Welcome Bot`.
 
 ## Slash Commands
 

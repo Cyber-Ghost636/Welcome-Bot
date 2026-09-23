@@ -18,7 +18,6 @@ from .config import (
     BUNGIE_CLAN_ID,
     DEFAULT_DUNGEON_THUMBNAIL_URL,
     DUNGEON_HISTORY_COUNT,
-    GOLD_CUP_PATH,
     INITIAL_BASELINE_POST_WINDOW_SECONDS,
     SOLO_ACTIVITY_MODES,
     SOLO_CHECK_INTERVAL_MINUTES,
@@ -38,28 +37,53 @@ startup_solo_scan_done = False
 
 
 DUNGEON_NAMES = {
+    # Multiple activity hashes can map to the same dungeon title
+    # (normal/master variants, rotations, or backend activity versions).
+    # Repeated names here are intentional for canonical naming.
+    # Shattered Throne
     1375089621: "Shattered Throne",
     2032534090: "Shattered Throne",
+
+    # Pit of Heresy
     1042180643: "Pit of Heresy",
+    
     2582501063: "Pit of Heresy",
+
+    # Prophecy
     2296816009: "Prophecy",
     3637651331: "Prophecy",
     1077850348: "Prophecy",
+
+    # Grasp of Avarice
     4078656646: "Grasp of Avarice",
+
+    # Duality
     3132816111: "Duality",
-    3635748805: "Duality",  # Added Normal Difficulty
-    1826478593: "Duality",  # Added Master Difficulty
-    -659218491: "Duality",  # Signed 32-bit Normal Difficulty
+    3635748805: "Duality",  # Normal Mode
+    1826478593: "Duality",  # Master Mode
+    -659218491: "Duality",  # Signed 32-bit Normal Mode
+    
+    # Spire of the Watcher
     422102671: "Spire of the Watcher",
     1225969316: "Spire of the Watcher",
     1262462921: "Spire of the Watcher",
+
+    # Ghosts of the Deep
     1451777341: "Ghosts of the Deep",
     1094262727: "Ghosts of the Deep",
     313828469: "Ghosts of the Deep",
+
+    # Warlord's Ruin
     3732368189: "Warlord's Ruin",
     2004855007: "Warlord's Ruin",
+    -562599107: "Warlord's Ruin",  # FIXED: Signed 32-bit variation for 3732368189
+
+    # Vesper's Host
     3138284691: "Vesper's Host",
     300092127: "Vesper's Host",
+    -1156682605: "Vesper's Host", # FIXED: Signed 32-bit variation for 313828469
+
+    # Sundered Doctrine
     247869137: "Sundered Doctrine",
 }
 
@@ -162,6 +186,33 @@ def get_dungeon_name(reference_id):
     return "Dungeon"
 
 
+async def resolve_activity_name(reference_id):
+    known_name = get_dungeon_name(reference_id)
+    if known_name and known_name != "Dungeon":
+        return known_name
+
+    try:
+        activity_hash = int(reference_id)
+    except (TypeError, ValueError):
+        return "Dungeon"
+
+    if bungie_api is None:
+        return "Dungeon"
+
+    try:
+        definition = await bungie_api.get_activity_definition(activity_hash)
+    except Exception:
+        return "Dungeon"
+
+    display_name = (definition.get("displayProperties") or {}).get("name")
+    if not display_name:
+        return "Dungeon"
+
+    if activity_name_matches_special_solo_activity(display_name):
+        return normalize_special_solo_activity_display_name(display_name)
+    return str(display_name)
+
+
 def resolve_dungeon_image_by_name(dungeon_name: str, guild_config):
     if not dungeon_name:
         return None
@@ -170,6 +221,7 @@ def resolve_dungeon_image_by_name(dungeon_name: str, guild_config):
         text = str(value or "").casefold().strip()
         if not text:
             return ""
+        text = re.sub(r"^the\s+", "", text)
         text = re.sub(r"^exotic\s+mission\s*-\s*", "", text)
         text = re.sub(r"\s*:\s*(customize|standard)\b", "", text)
         text = re.sub(r"\s*\((normal|master|legend|expert|customize|standard)\)\s*$", "", text)
@@ -200,15 +252,49 @@ def resolve_dungeon_image_by_name(dungeon_name: str, guild_config):
     return fallback_text or None
 
 
+async def resolve_solo_thumbnail_url(dungeon_name: str, guild_config, activity_hash=None):
+    thumbnail_url = resolve_dungeon_image_by_name(dungeon_name, guild_config)
+    if thumbnail_url:
+        return thumbnail_url
+
+    activity_hash_int = None
+    try:
+        if activity_hash is not None:
+            activity_hash_int = int(activity_hash)
+    except (TypeError, ValueError):
+        activity_hash_int = None
+
+    # Retry map lookup via canonical hash mapping when title variants don't match.
+    if activity_hash_int is not None:
+        known_name = get_dungeon_name(activity_hash_int)
+        if known_name and known_name != "Dungeon":
+            mapped_thumbnail = resolve_dungeon_image_by_name(known_name, guild_config)
+            if mapped_thumbnail:
+                return mapped_thumbnail
+
+    if activity_hash_int is not None and bungie_api is not None:
+        try:
+            definition = await bungie_api.get_activity_definition(activity_hash_int)
+            display_name = (definition.get("displayProperties") or {}).get("name")
+            if display_name:
+                if activity_name_matches_special_solo_activity(display_name):
+                    display_name = normalize_special_solo_activity_display_name(display_name)
+                display_name_thumbnail = resolve_dungeon_image_by_name(display_name, guild_config)
+                if display_name_thumbnail:
+                    return display_name_thumbnail
+            icon_path = (definition.get("displayProperties") or {}).get("icon")
+            icon_url = normalize_bungie_image_url(icon_path)
+            if icon_url:
+                return icon_url
+        except Exception:
+            pass
+
+    return str(DEFAULT_DUNGEON_THUMBNAIL_URL or "").strip() or None
+
+
 def should_hide_status_for_short_exotic_run(activity_name: str | None, duration_seconds) -> bool:
     name_text = str(activity_name or "").casefold().strip()
-    if not name_text.startswith("exotic mission -"):
-        return False
-    try:
-        duration_value = int(duration_seconds)
-    except (TypeError, ValueError):
-        return False
-    return duration_value < 10 * 60
+    return name_text.startswith("exotic mission -")
 
 
 def parse_bungie_profile_input(value: str):
@@ -525,9 +611,13 @@ async def post_solo_completion(guild: discord.Guild, channel_id: str, player, co
         return
 
     player_name = player.get("global_name", "Guardian")
-    dungeon_name = get_dungeon_name(completion.get("activity_hash"))
+    dungeon_name = await resolve_activity_name(completion.get("activity_hash"))
     guild_config = get_guild_config(rules_config, guild.id)
-    thumbnail_url = resolve_dungeon_image_by_name(dungeon_name, guild_config)
+    thumbnail_url = await resolve_solo_thumbnail_url(
+        dungeon_name,
+        guild_config,
+        completion.get("activity_hash"),
+    )
     embed = build_solo_embed(
         player_name,
         normalize_bungie_image_url(player.get("avatar_url")),
@@ -566,6 +656,7 @@ async def run_solo_check_for_guild(guild: discord.Guild):
 
     seen_instance_ids = set(guild_config.get("dungeon_seen_instance_ids", []))
     posted_instance_ids = set(guild_config.get("dungeon_posted_instance_ids", []))
+    processed_instance_ids = set()
     mark_seen_ids = set()
     mark_posted_ids = set()
 
@@ -573,8 +664,13 @@ async def run_solo_check_for_guild(guild: discord.Guild):
         completions = await detect_new_solo_dungeon_completions(player, posted_instance_ids)
         for completion in completions:
             instance_id = completion.get("instance_id")
-            if not instance_id or instance_id in posted_instance_ids:
+            if (
+                not instance_id
+                or instance_id in posted_instance_ids
+                or instance_id in processed_instance_ids
+            ):
                 continue
+            processed_instance_ids.add(instance_id)
 
             completion_dt = parse_bungie_timestamp(completion.get("period"))
             if completion_dt is None or completion_dt < threshold_dt:
@@ -617,8 +713,13 @@ async def run_solo_check_for_guild(guild: discord.Guild):
 async def solo_loop():
     if bungie_api is None:
         return
+    print(f"[STS_SOLO_LOOP] Starting cycle for {len(bot.guilds)} guild(s)")
     for guild in bot.guilds:
-        await run_solo_check_for_guild(guild)
+        try:
+            await run_solo_check_for_guild(guild)
+        except Exception as e:
+            print(f"[STS_SOLO_LOOP] Guild {guild.id} failed: {e}")
+    print("[STS_SOLO_LOOP] Cycle complete")
 
 
 @solo_loop.before_loop

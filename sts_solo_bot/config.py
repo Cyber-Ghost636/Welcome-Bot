@@ -11,7 +11,6 @@ BUNGIE_CLAN_ID = os.getenv("STS_BUNGIE_CLAN_ID") or os.getenv("BUNGIE_CLAN_ID")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 CONFIG_FILE = BASE_DIR / "sts_server_config.json"
-GOLD_CUP_PATH = BASE_DIR / "Gold-Cup.png"
 DEFAULT_DUNGEON_THUMBNAIL_URL = os.getenv("STS_DUNGEON_THUMBNAIL_URL", "").strip()
 
 SOLO_CHECK_INTERVAL_MINUTES = int(os.getenv("STS_SOLO_CHECK_INTERVAL_MINUTES", "5"))

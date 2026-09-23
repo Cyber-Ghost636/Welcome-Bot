@@ -45,9 +45,9 @@ async def main():
     await bot.start(TOKEN)
 
 bungie_api = None
-SOLO_CHECK_INTERVAL_MINUTES = int(os.getenv("SOLO_CHECK_INTERVAL_MINUTES", "5"))
+SOLO_CHECK_INTERVAL_MINUTES = int(os.getenv("SOLO_CHECK_INTERVAL_MINUTES", "2"))
 TEAM_ACTIVITY_CHECK_INTERVAL_MINUTES = int(os.getenv("TEAM_ACTIVITY_CHECK_INTERVAL_MINUTES", "5"))
-SOLO_POST_DELAY_MINUTES = max(0, int(os.getenv("SOLO_POST_DELAY_MINUTES", "3")))
+SOLO_POST_DELAY_MINUTES = max(0, int(os.getenv("SOLO_POST_DELAY_MINUTES", "1")))
 TEAM_DUNGEON_POST_DELAY_MINUTES = max(0, int(os.getenv("TEAM_DUNGEON_POST_DELAY_MINUTES", "3")))
 TEAM_RAID_POST_DELAY_MINUTES = max(0, int(os.getenv("TEAM_RAID_POST_DELAY_MINUTES", "3")))
 DUNGEON_HISTORY_COUNT = int(os.getenv("DUNGEON_HISTORY_COUNT", "50"))
@@ -60,7 +60,7 @@ SOLO_ACTIVITY_MODES = [82, 84, 63, 88, 7, 0]
 INITIAL_BASELINE_POST_WINDOW_SECONDS = 6 * 60 * 60
 SOLO_DEBUG_LOGS = os.getenv("SOLO_DEBUG_LOGS", "0").strip() in {"1", "true", "yes", "on"}
 SOLO_POST_CHECKPOINTS = os.getenv("SOLO_POST_CHECKPOINTS", "0").strip().casefold() in {"1", "true", "yes", "on"}
-SOLO_MAX_POSTS_PER_CYCLE = max(1, int(os.getenv("SOLO_MAX_POSTS_PER_CYCLE", "3")))
+SOLO_MAX_POSTS_PER_CYCLE = max(1, int(os.getenv("SOLO_MAX_POSTS_PER_CYCLE", "10")))
 BOT_NICKNAME = os.getenv("BOT_NICKNAME", "Wheelie Bin").strip()
 BOT_USERNAME = os.getenv("BOT_USERNAME", "Wheelie Bin").strip()
 startup_solo_scan_done = False
@@ -95,13 +95,7 @@ def format_int_stat(value):
 
 def should_hide_status_for_short_exotic_run(activity_name: str | None, duration_seconds) -> bool:
     name_text = str(activity_name or "").casefold().strip()
-    if not name_text.startswith("exotic mission -"):
-        return False
-    try:
-        duration_value = int(duration_seconds)
-    except (TypeError, ValueError):
-        return False
-    return duration_value < 10 * 60
+    return name_text.startswith("exotic mission -")
 
 
 def load_rules_config():
@@ -347,7 +341,19 @@ def get_dungeon_name(reference_id, guild_config=None):
         return "Dungeon"
     if activity_hash in SPECIAL_SOLO_ACTIVITY_NAMES:
         return normalize_special_solo_activity_display_name(SPECIAL_SOLO_ACTIVITY_NAMES[activity_hash])
-    return DUNGEON_NAMES.get(activity_hash)
+    if activity_hash in DUNGEON_NAMES:
+        return DUNGEON_NAMES[activity_hash]
+
+    # Bungie activity hashes can appear in signed or unsigned 32-bit form.
+    if activity_hash < 0:
+        unsigned_hash = activity_hash + (1 << 32)
+        return DUNGEON_NAMES.get(unsigned_hash)
+
+    if activity_hash > 0x7FFFFFFF:
+        signed_hash = activity_hash - (1 << 32)
+        return DUNGEON_NAMES.get(signed_hash)
+
+    return None
 
 
 def get_full_clear_min_seconds(activity_hash, guild_config=None, dungeon_name=None):
@@ -673,7 +679,7 @@ def resolve_dungeon_image_by_name(dungeon_name: str, guild_config):
         if not text:
             return ""
         text = re.sub(r"^exotic\s+mission\s*-\s*", "", text)
-        text = re.sub(r"\s*:\s*(customize|standard)\b", "", text)
+        text = re.sub(r"\s*:\s*(customize|standard|normal|master|legend|expert)\b", "", text)
         text = re.sub(r"\s*\((normal|master|legend|expert|customize|standard)\)\s*$", "", text)
         text = re.sub(r"[^a-z0-9]+", "", text)
         return text
@@ -700,6 +706,123 @@ def resolve_dungeon_image_by_name(dungeon_name: str, guild_config):
 
     fallback = config.get("dungeon_embed_image")
     return str(fallback) if fallback else None
+
+
+def is_default_solo_thumbnail_url(url: str | None, guild_config=None):
+    normalized = str(url or "").strip()
+    if not normalized:
+        return False
+
+    config_default = str((guild_config or {}).get("dungeon_embed_image") or "").strip()
+    if config_default and normalized == config_default:
+        return True
+
+    return normalized == "https://i.postimg.cc/vBbCWrts/Dark-Skull.gif"
+
+
+async def resolve_solo_thumbnail_url(dungeon_name: str, guild_config, activity_hash=None):
+    thumbnail_url = resolve_dungeon_image_by_name(dungeon_name, guild_config)
+    if thumbnail_url:
+        return thumbnail_url
+
+    activity_hash_int = None
+    try:
+        if activity_hash is not None:
+            activity_hash_int = int(activity_hash)
+    except (TypeError, ValueError):
+        activity_hash_int = None
+
+    # If the incoming activity hash variant differs from the configured title,
+    # retry map lookup using our canonical known dungeon name from hash mapping.
+    if activity_hash_int is not None:
+        known_dungeon_name = get_dungeon_name(activity_hash_int, guild_config=guild_config)
+        if known_dungeon_name and known_dungeon_name != "Dungeon":
+            mapped_thumbnail_url = resolve_dungeon_image_by_name(known_dungeon_name, guild_config)
+            if mapped_thumbnail_url:
+                return mapped_thumbnail_url
+
+    if activity_hash_int is not None and bungie_api is not None:
+        try:
+            definition = await bungie_api.get_activity_definition(activity_hash_int)
+            icon_path = (definition.get("displayProperties") or {}).get("icon")
+            icon_url = normalize_bungie_image_url(icon_path)
+            if icon_url:
+                return icon_url
+        except Exception:
+            pass
+
+    # Final guaranteed fallback for solo embeds.
+    config_fallback = str((guild_config or {}).get("dungeon_embed_image") or "").strip()
+    if config_fallback:
+        return config_fallback
+    return "https://i.postimg.cc/vBbCWrts/Dark-Skull.gif"
+
+
+def looks_like_exotic_title(title_text: str) -> bool:
+    normalized = str(title_text or "").casefold().strip()
+    if not normalized:
+        return False
+    if normalized.startswith("exotic mission -"):
+        return True
+    exotic_keywords = (
+        "encore",
+        "seraph",
+        "presage",
+        "vox obscura",
+        "avalon",
+        "starcrossed",
+        "zero hour",
+        "the whisper",
+        "kell's fall",
+        "kells fall",
+        "heliostat",
+        "derealize",
+    )
+    return any(keyword in normalized for keyword in exotic_keywords)
+
+
+async def auto_repair_recent_exotic_thumbnails(guild: discord.Guild, guild_config, limit: int = 100):
+    channel_id = (guild_config or {}).get("dungeon_channel_id")
+    if not channel_id:
+        return 0
+
+    try:
+        channel = await bot.fetch_channel(int(channel_id))
+    except Exception:
+        return 0
+
+    if not isinstance(channel, discord.TextChannel) or channel.guild.id != guild.id:
+        return 0
+
+    updated = 0
+    async for message in channel.history(limit=max(1, int(limit))):
+        if not message.embeds:
+            continue
+        if message.author.id != bot.user.id:
+            continue
+
+        original = message.embeds[0]
+        title = str(getattr(original, "title", "") or "").strip()
+        if not looks_like_exotic_title(title):
+            continue
+
+        existing_thumbnail = str(getattr(getattr(original, "thumbnail", None), "url", "") or "").strip()
+        if existing_thumbnail:
+            continue
+
+        thumbnail_url = await resolve_solo_thumbnail_url(title, guild_config, None)
+        if not thumbnail_url:
+            continue
+
+        try:
+            updated_embed = discord.Embed.from_dict(original.to_dict())
+            updated_embed.set_thumbnail(url=thumbnail_url)
+            await message.edit(embed=updated_embed)
+            updated += 1
+        except Exception:
+            continue
+
+    return updated
 
 
 def resolve_text_channel_from_input(guild: discord.Guild, channel_input: str | None):
@@ -1220,11 +1343,12 @@ async def get_server_watch_players_for_guild(guild: discord.Guild):
     players = []
     seen_memberships = set()
     seen_names = set()
+    unresolved_candidate_names = []
     for member in guild.members:
         if member.bot:
             continue
 
-        candidate_names = [member.display_name, member.name]
+        candidate_names = [member.display_name, member.global_name, member.name]
         resolved_player = None
         for candidate_name in candidate_names:
             normalized_candidate = normalize_member_name(candidate_name)
@@ -1239,6 +1363,10 @@ async def get_server_watch_players_for_guild(guild: discord.Guild):
                 break
 
         if not resolved_player:
+            for candidate_name in candidate_names:
+                normalized_candidate = normalize_member_name(candidate_name)
+                if normalized_candidate:
+                    unresolved_candidate_names.append(candidate_name)
             continue
 
         membership_key = (
@@ -1250,13 +1378,61 @@ async def get_server_watch_players_for_guild(guild: discord.Guild):
         seen_memberships.add(membership_key)
         players.append(resolved_player)
 
+    # If direct name resolution misses some members, attempt clan-roster matching
+    # to reduce false negatives caused by Discord nickname differences.
+    if unresolved_candidate_names and BUNGIE_CLAN_ID:
+        try:
+            clan_roster = await get_auto_watch_players_for_clan()
+        except Exception as e:
+            solo_debug(f"Server watch fallback clan lookup failed: {e}")
+            clan_roster = []
+
+        if clan_roster:
+            for candidate_name in unresolved_candidate_names:
+                roster_match = pick_best_roster_match(candidate_name, clan_roster)
+                if not roster_match:
+                    continue
+
+                membership_id = roster_match.get("membership_id")
+                membership_type = roster_match.get("membership_type")
+                if not membership_id or membership_type is None:
+                    continue
+
+                membership_key = (str(membership_type), str(membership_id))
+                if membership_key in seen_memberships:
+                    continue
+
+                try:
+                    resolved_player = await resolve_player_from_membership(
+                        membership_id,
+                        membership_type,
+                        display_name=roster_match.get("global_name") or "Guardian",
+                    )
+                except Exception:
+                    resolved_player = None
+
+                if not resolved_player:
+                    continue
+
+                seen_memberships.add(membership_key)
+                players.append(resolved_player)
+
     return players
 
 
 async def get_team_watched_players_for_guild(guild_config, guild: discord.Guild | None = None):
     scope = get_solo_watch_scope(guild_config)
     if scope == "server":
-        return await get_server_watch_players_for_guild(guild)
+        server_players = await get_server_watch_players_for_guild(guild)
+        if server_players:
+            return server_players
+        # Fallback when Discord->Bungie name resolution yields no players.
+        if BUNGIE_CLAN_ID:
+            try:
+                return await get_auto_watch_players_for_clan()
+            except Exception as e:
+                print(f"Failed fallback clan roster for server watch scope: {e}")
+        return list((guild_config or {}).get("dungeon_watch", []) or [])
 
     if scope == "clan" and BUNGIE_CLAN_ID:
         try:
@@ -1303,7 +1479,21 @@ async def post_solo_completion(guild: discord.Guild, channel_id: str, player, co
 
     player_avatar = normalize_bungie_image_url(player.get("avatar_url"))
     dungeon_name = await resolve_activity_name(completion.get("activity_hash"), guild_config=guild_config)
-    thumbnail_url = resolve_dungeon_image_by_name(dungeon_name, guild_config)
+    thumbnail_url = await resolve_solo_thumbnail_url(
+        dungeon_name,
+        guild_config,
+        completion.get("activity_hash"),
+    )
+    if not thumbnail_url:
+        print(
+            f"[SOLO_THUMBNAIL] Missing thumbnail guild={guild.id} "
+            f"activity_hash={completion.get('activity_hash')} dungeon={dungeon_name}"
+        )
+    else:
+        solo_debug(
+            f"[SOLO_THUMBNAIL] Using thumbnail guild={guild.id} "
+            f"activity_hash={completion.get('activity_hash')} url={thumbnail_url}"
+        )
     is_flawless = completion.get("flawless", False)
     is_solo = completion.get("solo", False)
     duration_seconds = completion.get("duration_seconds")
@@ -1577,6 +1767,14 @@ async def run_solo_check_for_guild(guild: discord.Guild):
     rules_config[str(guild.id)] = guild_config
     save_rules_config(rules_config)
 
+    # Keep recent exotic posts healthy even when Discord/Bungie image URLs are inconsistent.
+    try:
+        repaired = await auto_repair_recent_exotic_thumbnails(guild, guild_config, limit=100)
+        if repaired:
+            solo_debug(f"Auto-repaired missing exotic thumbnails: {repaired}")
+    except Exception:
+        pass
+
 
 
 async def run_team_activity_check_for_guild(guild: discord.Guild):
@@ -1626,8 +1824,13 @@ async def run_startup_solo_scan_once():
 async def solo_dungeon_check_loop():
     if bungie_api is None:
         return
+    print(f"[SOLO_LOOP] Starting cycle for {len(bot.guilds)} guild(s)", flush=True)
     for guild in bot.guilds:
-        await run_solo_check_for_guild(guild)
+        try:
+            await run_solo_check_for_guild(guild)
+        except Exception as e:
+            print(f"[SOLO_LOOP] Guild {guild.id} failed: {e}", flush=True)
+    print("[SOLO_LOOP] Cycle complete", flush=True)
 
 
 @solo_dungeon_check_loop.before_loop
@@ -1795,22 +1998,8 @@ async def on_ready():
             except Exception as e:
                 print(f"Failed to set nickname in guild {guild.id}: {e}", flush=True)
 
-    if BUNGIE_API_KEY and bungie_api is None:
-        bungie_api = BungieAPI(BUNGIE_API_KEY)
-    if not BUNGIE_API_KEY:
-        print("BUNGIE_API_KEY is missing. Solo dungeon tracking is disabled.")
-    else:
-        if not BUNGIE_CLAN_ID:
-            print("BUNGIE_CLAN_ID is missing. Set it for automatic clan-wide solo tracking.")
-        if not solo_dungeon_check_loop.is_running():
-            solo_dungeon_check_loop.start()
-        if not team_activity_check_loop.is_running():
-            team_activity_check_loop.start()
-        guardian_rank_commands.start()
-
-        if not startup_solo_scan_done and (startup_solo_scan_task is None or startup_solo_scan_task.done()):
-            startup_solo_scan_task = asyncio.create_task(run_startup_solo_scan_once())
-
+    # Sync commands early so Discord reflects adds/removals immediately,
+    # even if startup solo scans take a while.
     try:
         synced = await asyncio.wait_for(bot.tree.sync(), timeout=20)
         print(f'Synced {len(synced)} global command(s)')
@@ -1823,8 +2012,51 @@ async def on_ready():
                 f'Cleared guild-specific command copies for {guild.name} '
                 f'({guild.id}); now {len(guild_synced)} guild command(s)'
             )
+
+        # Defensive cleanup: explicitly remove deprecated commands if Discord
+        # still keeps stale registrations after normal sync.
+        stale_command_names = {"backfill_exotic_thumbnails"}
+        try:
+            app_id = bot.application_id
+            if app_id is not None:
+                global_commands = await bot.tree.fetch_commands()
+                for command in global_commands:
+                    if str(getattr(command, "name", "")) in stale_command_names:
+                        await bot.http.delete_global_command(app_id, int(command.id))
+                        print(f"Removed stale global command: {command.name}")
+
+                for guild in bot.guilds:
+                    guild_commands = await bot.tree.fetch_commands(guild=guild)
+                    for command in guild_commands:
+                        if str(getattr(command, "name", "")) in stale_command_names:
+                            await bot.http.delete_guild_command(app_id, int(guild.id), int(command.id))
+                            print(f"Removed stale guild command in {guild.id}: {command.name}")
+        except Exception as cleanup_error:
+            print(f"Stale command cleanup skipped: {cleanup_error}")
     except Exception as e:
         print(f'Failed to sync global commands: {e}')
+
+    if BUNGIE_API_KEY and bungie_api is None:
+        bungie_api = BungieAPI(BUNGIE_API_KEY)
+    if not BUNGIE_API_KEY:
+        print("BUNGIE_API_KEY is missing. Solo dungeon tracking is disabled.")
+    else:
+        if not BUNGIE_CLAN_ID:
+            print("BUNGIE_CLAN_ID is missing. Set it for automatic clan-wide solo tracking.")
+
+        # Run startup scan before starting loops to avoid duplicate posts
+        # caused by overlapping startup/task-loop processing.
+        if not startup_solo_scan_done:
+            try:
+                await run_startup_solo_scan_once()
+            except Exception as e:
+                print(f"Startup solo scan failed: {e}")
+
+        if not solo_dungeon_check_loop.is_running():
+            solo_dungeon_check_loop.start()
+        if not team_activity_check_loop.is_running():
+            team_activity_check_loop.start()
+        guardian_rank_commands.start()
 
     fallback_channel_id = os.getenv('RULES_CHANNEL_ID')
     fallback_guild_id = None
@@ -2452,6 +2684,17 @@ async def post_latest_solo_embed(
     player_name = resolved_player.get("global_name") or str(gamertag).strip()
     player_avatar = normalize_bungie_image_url(resolved_player.get("avatar_url"))
 
+    thumbnail_url = await resolve_solo_thumbnail_url(
+        dungeon_name,
+        guild_config,
+        completion.get("activity_hash"),
+    )
+    if not thumbnail_url:
+        print(
+            f"[SOLO_TEST_THUMBNAIL] Missing thumbnail guild={interaction.guild_id} "
+            f"activity_hash={completion.get('activity_hash')} dungeon={dungeon_name}"
+        )
+
     embed = build_dungeon_embed(
         player_name,
         player_avatar,
@@ -2460,6 +2703,7 @@ async def post_latest_solo_embed(
         True,
         not checkpoint,
         guild_config,
+        thumbnail_url=thumbnail_url,
     )
     kills_text = format_int_stat(completion.get("kills")) or "—"
     deaths_text = format_int_stat(completion.get("deaths")) or "—"
@@ -2472,12 +2716,7 @@ async def post_latest_solo_embed(
     if not hide_status:
         embed.add_field(name="Status", value=status_text, inline=True)
 
-    gold_cup_path = BASE_DIR / "Gold-Cup.png"
-    if gold_cup_path.exists():
-        with gold_cup_path.open("rb") as f:
-            await target_channel.send(embed=embed, file=discord.File(f, filename="Gold-Cup.png"))
-    else:
-        await target_channel.send(embed=embed)
+    await target_channel.send(embed=embed)
 
     await interaction.response.send_message(
         acknowledgement_text.format(player_name=player_name, target_channel=target_channel.mention),

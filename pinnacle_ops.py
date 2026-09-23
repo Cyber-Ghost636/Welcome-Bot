@@ -167,6 +167,10 @@ def normalize_special_solo_activity_display_name(name: str | None):
     # Standard/Normal/Customize -> Customize, Expert/Legend -> Master.
     value = re.sub(r":\s*Customize\b", " (Customize)", value, flags=re.IGNORECASE)
     value = re.sub(r":\s*Standard\b", " (Customize)", value, flags=re.IGNORECASE)
+    value = re.sub(r":\s*Normal\b", " (Customize)", value, flags=re.IGNORECASE)
+    value = re.sub(r":\s*Legend\b", " (Master)", value, flags=re.IGNORECASE)
+    value = re.sub(r":\s*Expert\b", " (Master)", value, flags=re.IGNORECASE)
+    value = re.sub(r":\s*Master\b", " (Master)", value, flags=re.IGNORECASE)
     value = re.sub(r"\(Standard\)", "(Customize)", value, flags=re.IGNORECASE)
     value = re.sub(r"\(Customize\)", "(Customize)", value, flags=re.IGNORECASE)
     value = re.sub(r"\(Normal\)", "(Customize)", value, flags=re.IGNORECASE)

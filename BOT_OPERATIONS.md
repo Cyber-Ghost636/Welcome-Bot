@@ -75,7 +75,7 @@ sudo journalctl -u welcome-bot -b --no-pager
 Run these after editing code:
 
 ```bash
-cd /home/wh33ls/welcome-bot
+cd /home/wh33ls/Documents/Welcome\ Bot
 ./scripts/pre_restart_check.sh
 sudo systemctl restart welcome-bot
 sudo systemctl --no-pager --full status welcome-bot | head -n 20
@@ -96,7 +96,7 @@ Team raid and team dungeon checks now run on a dedicated interval so posts can a
 Run this before restart to catch common startup issues:
 
 ```bash
-cd /home/wh33ls/welcome-bot
+cd /home/wh33ls/Documents/Welcome\ Bot
 ./scripts/pre_restart_check.sh
 ```
 
@@ -104,6 +104,21 @@ What it checks:
 
 - Invalid slash-command decorator namespace typos (`@app.commands.*`)
 - Python syntax/compile issues across top-level `*.py` files
+
+## One-Command Health Check
+
+Use this to verify both services, recent logs, and the canonical symlink path:
+
+```bash
+cd /home/wh33ls/Documents/Welcome\ Bot
+./scripts/health_check_services.sh
+```
+
+Optional: show more logs by passing a line count:
+
+```bash
+./scripts/health_check_services.sh 50
+```
 
 ## If Service Fails To Start
 
@@ -131,7 +146,7 @@ sudo systemctl restart welcome-bot
 If you want to run directly in shell for debugging:
 
 ```bash
-cd /home/wh33ls/welcome-bot
+cd /home/wh33ls/Documents/Welcome\ Bot
 source .venv/bin/activate
 python bot.py
 ```

@@ -1,0 +1,15 @@
+[Unit]
+Description=Destiny 2 Welcome Bot Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wh33ls
+WorkingDirectory=/home/wh33ls/welcome-bot
+ExecStart=/home/wh33ls/welcome-bot/.venv/bin/python /home/wh33ls/welcome-bot/bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
