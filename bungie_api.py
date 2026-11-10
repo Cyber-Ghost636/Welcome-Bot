@@ -15,7 +15,10 @@ def normalize_bungie_image_url(path_value):
 class BungieAPI:
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.session = aiohttp.ClientSession(headers={"X-API-Key": self.api_key})
+        self.session = aiohttp.ClientSession(
+            headers={"X-API-Key": self.api_key},
+            timeout=aiohttp.ClientTimeout(total=20, connect=10, sock_read=15),
+        )
 
     async def search_global_name(self, global_name: str):
         """

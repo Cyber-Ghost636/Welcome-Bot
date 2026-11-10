@@ -1,0 +1,34 @@
+[
+  {
+    "week": 1,
+    "hunts": ["Despair", "Fear", "Rage"]
+  },
+  {
+    "week": 2,
+    "hunts": ["Isolation", "Pride", "Servitude"]
+  },
+  {
+    "week": 3,
+    "hunts": ["Insanity", "Anguish", "Despair"]
+  },
+  {
+    "week": 4,
+    "hunts": ["Fear", "Isolation", "Rage"]
+  },
+  {
+    "week": 5,
+    "hunts": ["Anguish", "Pride", "Servitude"]
+  },
+  {
+    "week": 6,
+    "hunts": ["", "", ""]
+  },
+  {
+    "week": 7,
+    "hunts": ["", "", ""]
+  },
+  {
+    "week": 8,
+    "hunts": ["", "", ""]
+  }
+]

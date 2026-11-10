@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import io
+import os
 import re
 from urllib.parse import urlparse
 from datetime import datetime, timedelta, timezone
@@ -46,6 +48,7 @@ class TeamRaidTracker:
         self.initial_baseline_post_window_seconds = int(initial_baseline_post_window_seconds)
         self.post_delay_seconds = max(0, int(post_delay_minutes) * 60)
         self.min_completions = max(3, int(min_completions))
+        self.player_fetch_concurrency = max(1, int(os.getenv("TEAM_PLAYER_CONCURRENCY", "4")))
         self.activity_icon_cache = {}
         self.class_emoji_by_type = {
             0: ":titan:",
@@ -80,7 +83,7 @@ class TeamRaidTracker:
         kills_int = self._safe_int(kills) or 0
         deaths_int = self._safe_int(deaths) or 0
         if deaths_int <= 0:
-            return "Inf"
+            return "N/A"
         return f"{kills_int / deaths_int:.2f}"
 
     def _display_name_from_destiny_user(self, destiny_user):
@@ -194,6 +197,14 @@ class TeamRaidTracker:
         # Canonical form for resilient comparisons across punctuation/casing.
         return "".join(ch for ch in normalized.casefold() if ch.isalnum())
 
+    def _thumbnail_lookup_key(self, value: str):
+        text = str(value or "").casefold().strip()
+        if not text:
+            return ""
+        text = text.replace("resplendant", "resplendent")
+        text = text.replace("insurrectiopn", "insurrection")
+        return re.sub(r"[^a-z0-9]+", "", text)
+
     async def resolve_raid_difficulty_label(self, activity_hash, raid_name: str | None = None):
         activity_hash_int = self._safe_int(activity_hash)
         if activity_hash_int is None:
@@ -220,51 +231,122 @@ class TeamRaidTracker:
             return "Master"
         return "Standard"
 
+    async def resolve_raid_name(self, activity_hash, guild_config=None):
+        activity_hash_int = self._safe_int(activity_hash)
+        if activity_hash_int is None:
+            return "Raid"
+
+        bungie_api = self.get_bungie_api()
+        if bungie_api is None:
+            return "Raid"
+
+        candidate_hashes = {activity_hash_int}
+        if activity_hash_int < 0:
+            candidate_hashes.add(activity_hash_int + (1 << 32))
+        elif activity_hash_int > 0x7FFFFFFF:
+            candidate_hashes.add(activity_hash_int - (1 << 32))
+
+        for candidate_hash in candidate_hashes:
+            try:
+                definition = await bungie_api.get_activity_definition(candidate_hash)
+            except Exception:
+                continue
+
+            display_name = (definition.get("displayProperties") or {}).get("name")
+            if display_name:
+                return str(display_name)
+
+        resolved_name = await self.resolve_activity_name(activity_hash, guild_config=guild_config)
+        if not resolved_name:
+            return "Raid"
+
+        resolved_text = str(resolved_name).strip()
+        if resolved_text.casefold().startswith("dungeon (") and resolved_text.endswith(")"):
+            return "Raid"
+        return resolved_text
+
     async def resolve_raid_thumbnail_url(self, raid_name: str, activity_hash, guild_config):
         guild_config = guild_config or {}
         normalized_name = self._normalize_raid_name(raid_name)
         canonical_lookup = self._canonical_raid_key(normalized_name)
+        compact_lookup = self._thumbnail_lookup_key(normalized_name)
 
-        # Optional per-raid override map for custom art URLs.
-        custom_map = (
-            guild_config.get("team_raid_thumbnail_by_name")
-            or guild_config.get("raid_thumbnail_by_name")
-            or guild_config.get("team_dungeon_thumbnail_by_name")
-            or {}
-        )
-        if normalized_name and normalized_name in custom_map and custom_map[normalized_name]:
-            return str(custom_map[normalized_name])
+        # Keep raid mappings prioritized for raid posts.
+        custom_maps = [
+            guild_config.get("team_raid_thumbnail_by_name"),
+            guild_config.get("raid_thumbnail_by_name"),
+            guild_config.get("team_dungeon_thumbnail_by_name"),
+        ]
 
-        # Fuzzy match keys that may differ by suffix/punctuation casing.
-        normalized_lookup = str(normalized_name).casefold().strip()
-        for key, value in custom_map.items():
-            if not key or not value:
-                continue
-            key_normalized = self._normalize_raid_name(str(key)).casefold().strip()
-            key_canonical = self._canonical_raid_key(str(key))
-            if key_normalized == normalized_lookup:
-                return str(value)
-            if canonical_lookup and key_canonical == canonical_lookup:
-                return str(value)
+        def _find_thumbnail_in_map(name_map, lookup_name):
+            if not isinstance(name_map, dict):
+                return None
+
+            lookup_normalized_name = self._normalize_raid_name(lookup_name)
+            lookup_canonical = self._canonical_raid_key(lookup_normalized_name)
+            lookup_compact = self._thumbnail_lookup_key(lookup_normalized_name)
+
+            if (
+                lookup_normalized_name
+                and lookup_normalized_name in name_map
+                and name_map[lookup_normalized_name]
+            ):
+                return str(name_map[lookup_normalized_name])
+
+            normalized_lookup = str(lookup_normalized_name).casefold().strip()
+            for key, value in name_map.items():
+                if not key or not value:
+                    continue
+                key_normalized = self._normalize_raid_name(str(key)).casefold().strip()
+                key_canonical = self._canonical_raid_key(str(key))
+                key_compact = self._thumbnail_lookup_key(str(key))
+                if key_normalized == normalized_lookup:
+                    return str(value)
+                if lookup_canonical and key_canonical == lookup_canonical:
+                    return str(value)
+                if lookup_compact and key_compact == lookup_compact:
+                    return str(value)
+            return None
+
+        for custom_map in custom_maps:
+            matched = _find_thumbnail_in_map(custom_map, normalized_name)
+            if matched:
+                return matched
 
         # Auto-resolve thumbnail from Bungie activity definition.
         activity_hash_int = self._safe_int(activity_hash)
         if activity_hash_int is not None:
-            if activity_hash_int in self.activity_icon_cache:
-                return self.activity_icon_cache[activity_hash_int]
+            candidate_hashes = {activity_hash_int}
+            if activity_hash_int < 0:
+                candidate_hashes.add(activity_hash_int + (1 << 32))
+            elif activity_hash_int > 0x7FFFFFFF:
+                candidate_hashes.add(activity_hash_int - (1 << 32))
+
+            for candidate_hash in candidate_hashes:
+                if candidate_hash in self.activity_icon_cache:
+                    return self.activity_icon_cache[candidate_hash]
 
             bungie_api = self.get_bungie_api()
             if bungie_api is not None:
-                try:
-                    definition = await bungie_api.get_activity_definition(activity_hash_int)
+                for candidate_hash in candidate_hashes:
+                    try:
+                        definition = await bungie_api.get_activity_definition(candidate_hash)
+                    except Exception:
+                        continue
+
                     display = definition.get("displayProperties") or {}
+                    display_name = display.get("name")
+                    if display_name:
+                        for custom_map in custom_maps:
+                            mapped_from_definition = _find_thumbnail_in_map(custom_map, display_name)
+                            if mapped_from_definition:
+                                return mapped_from_definition
+
                     icon_path = display.get("icon")
                     icon_url = self._normalize_bungie_image_url(icon_path)
                     if icon_url:
-                        self.activity_icon_cache[activity_hash_int] = icon_url
+                        self.activity_icon_cache[candidate_hash] = icon_url
                         return icon_url
-                except Exception:
-                    pass
 
         # Fallback to global team/single-activity thumbnail settings.
         return (
@@ -312,6 +394,15 @@ class TeamRaidTracker:
             .get("destinyUserInfo", {})
             .get("membershipId")
         }
+        all_completed_ids_ordered = []
+        for entry in completed_entries:
+            membership_id = str(
+                (entry.get("player", {})
+                .get("destinyUserInfo", {})
+                .get("membershipId", ""))
+            ).strip()
+            if membership_id and membership_id not in all_completed_ids_ordered:
+                all_completed_ids_ordered.append(membership_id)
 
         if watched_membership_map:
             selected_completed_ids = sorted(
@@ -326,11 +417,12 @@ class TeamRaidTracker:
             return None
 
         selected_players = []
+        all_players = []
         for entry in completed_entries:
             entry_player = entry.get("player", {}) or {}
             destiny_user = (entry_player.get("destinyUserInfo", {}) or {})
             entry_membership_id = str(destiny_user.get("membershipId", "")).strip()
-            if entry_membership_id not in selected_completed_ids:
+            if not entry_membership_id:
                 continue
 
             entry_membership_type = self._safe_int(
@@ -362,20 +454,21 @@ class TeamRaidTracker:
             deaths = self._entry_stat_value(entry, "deaths")
             assists = self._entry_stat_value(entry, "assists")
 
-            selected_players.append(
-                {
-                    "membership_id": entry_membership_id,
-                    "membership_type": entry_membership_type,
-                    "character_id": entry_character_id,
-                    "name": self._display_name_from_destiny_user(destiny_user),
-                    "class_emoji": class_emoji,
-                    "class_name": self.class_name_by_type.get(class_type, "Guardian"),
-                    "power": power,
-                    "kills": kills,
-                    "deaths": deaths,
-                    "assists": assists,
-                }
-            )
+            player_payload = {
+                "membership_id": entry_membership_id,
+                "membership_type": entry_membership_type,
+                "character_id": entry_character_id,
+                "name": self._display_name_from_destiny_user(destiny_user),
+                "class_emoji": class_emoji,
+                "class_name": self.class_name_by_type.get(class_type, "Guardian"),
+                "power": power,
+                "kills": kills,
+                "deaths": deaths,
+                "assists": assists,
+            }
+            all_players.append(player_payload)
+            if entry_membership_id in selected_completed_ids:
+                selected_players.append(player_payload)
 
         players_by_id = {
             player_data.get("membership_id"): player_data
@@ -390,6 +483,33 @@ class TeamRaidTracker:
             else:
                 fallback_name = watched_membership_map.get(membership) if watched_membership_map else "Guardian"
                 ordered_players.append(
+                    {
+                        "membership_id": membership,
+                        "membership_type": None,
+                        "character_id": "",
+                        "name": fallback_name,
+                        "class_emoji": ":guardian:",
+                        "class_name": "Guardian",
+                        "power": None,
+                        "kills": 0,
+                        "deaths": 0,
+                        "assists": 0,
+                    }
+                )
+
+        all_players_by_id = {
+            player_data.get("membership_id"): player_data
+            for player_data in all_players
+            if player_data.get("membership_id")
+        }
+        ordered_all_players = []
+        for membership in all_completed_ids_ordered:
+            ordered_player = all_players_by_id.get(membership)
+            if ordered_player:
+                ordered_all_players.append(ordered_player)
+            else:
+                fallback_name = watched_membership_map.get(membership) if watched_membership_map else "Guardian"
+                ordered_all_players.append(
                     {
                         "membership_id": membership,
                         "membership_type": None,
@@ -421,6 +541,7 @@ class TeamRaidTracker:
                 for player_data in ordered_players
             ],
             "watched_players": ordered_players,
+            "players": ordered_all_players,
             "duration_seconds": duration_seconds,
             "was_started_from_beginning": pgcr.get("activityWasStartedFromBeginning", True),
         }
@@ -430,7 +551,20 @@ class TeamRaidTracker:
         if bungie_api is None or not completion:
             return
 
-        players = completion.get("watched_players", [])
+        watched_players = completion.get("watched_players", []) or []
+        all_players = completion.get("players", []) or []
+
+        players = []
+        seen_targets = set()
+        for player in [*watched_players, *all_players]:
+            membership_id = str(player.get("membership_id") or "").strip()
+            character_id = str(player.get("character_id") or "").strip()
+            target_key = (membership_id, character_id)
+            if target_key in seen_targets:
+                continue
+            seen_targets.add(target_key)
+            players.append(player)
+
         if not players:
             return
 
@@ -663,8 +797,8 @@ class TeamRaidTracker:
 
         lines.append("")
 
-        watched_players = completion.get("watched_players", [])
-        for index, player in enumerate(watched_players):
+        display_players = completion.get("players") or completion.get("watched_players", [])
+        for index, player in enumerate(display_players):
             player_name = player.get("name") or "Player"
             class_emoji = player.get("class_emoji") or ":guardian:"
             power = self._safe_int(player.get("power"))
@@ -698,12 +832,17 @@ class TeamRaidTracker:
             description_lines.append(f"<t:{int(completed_dt.timestamp())}:R>")
 
         embed = discord.Embed(
-            description="\n".join(description_lines),
+            description="\n".join(description_lines).strip(),
             color=discord.Color.gold(),
         )
 
-        watched_players = completion.get("watched_players", [])
-        for player in watched_players[:6]:
+        display_players = completion.get("players") or completion.get("watched_players", [])
+        display_players = sorted(
+            display_players,
+            key=lambda player: self._safe_int(player.get("kills")) or 0,
+            reverse=True,
+        )
+        for player in display_players[:6]:
             player_name = self._compact_player_name(player.get("name"))
             class_icon = self._resolve_class_icon(player, guild_config)
             power = self._safe_int(player.get("power"))
@@ -713,14 +852,13 @@ class TeamRaidTracker:
             assists = self._safe_int(player.get("assists")) or 0
             kd_text = self._kd_text(kills, deaths)
 
-            field_value = "\n".join(
-                [
-                    f"{class_icon} :power:{power_text}",
-                    f"K: {kills} | D: {deaths} | A: {assists}",
-                    f"K/D: {kd_text}",
-                ]
+            embed.add_field(
+                name=f"{player_name} {class_icon} :power:{power_text}",
+                value=f"K: {kills} | D: {deaths} | A: {assists} | K/D: {kd_text}",
+                inline=True,
             )
-            embed.add_field(name=player_name, value=field_value, inline=True)
+
+        embed.set_footer(text="via Wheelie Bin")
 
         return embed
 
@@ -764,6 +902,7 @@ class TeamRaidTracker:
         seen_instance_ids,
         watched_membership_map,
         processed_instance_ids,
+        earliest_relevant_dt=None,
     ):
         completions = []
         bungie_api = self.get_bungie_api()
@@ -790,10 +929,19 @@ class TeamRaidTracker:
             )
             activities = history.get("activities", [])
             for activity in activities:
+                activity_period = self.parse_bungie_timestamp(activity.get("period"))
+                if (
+                    earliest_relevant_dt is not None
+                    and activity_period is not None
+                    and activity_period < earliest_relevant_dt
+                ):
+                    break
+
                 details = activity.get("activityDetails", {})
                 instance_id = str(details.get("instanceId", ""))
                 if not instance_id or instance_id in seen_instance_ids or instance_id in processed_instance_ids:
                     continue
+                processed_instance_ids.add(instance_id)
 
                 values = activity.get("values", {})
                 completed = values.get("completed", {}).get("basic", {}).get("value", 0) == 1
@@ -852,7 +1000,6 @@ class TeamRaidTracker:
                 # Keep the instance id from activity history for consistency.
                 completion["instance_id"] = instance_id
                 completions.append(completion)
-                processed_instance_ids.add(instance_id)
 
         completions.sort(key=lambda item: item.get("period", ""))
         return completions
@@ -869,7 +1016,21 @@ class TeamRaidTracker:
             return
 
         guild_config = self.get_guild_config(guild.id)
-        raid_name = await self.resolve_activity_name(completion.get("activity_hash"), guild_config=guild_config)
+
+        raid_name = None
+        activity_hash_int = self._safe_int(completion.get("activity_hash"))
+        if activity_hash_int is not None:
+            bungie_api = self.get_bungie_api()
+            if bungie_api is not None:
+                try:
+                    definition = await bungie_api.get_activity_definition(activity_hash_int)
+                    raid_name = (definition.get("displayProperties") or {}).get("name")
+                except Exception:
+                    raid_name = None
+
+        if not raid_name:
+            raid_name = await self.resolve_raid_name(completion.get("activity_hash"), guild_config=guild_config)
+
         completion["difficulty"] = await self.resolve_raid_difficulty_label(
             completion.get("activity_hash"),
             raid_name,
@@ -903,26 +1064,40 @@ class TeamRaidTracker:
         team_last_checked_dt = self.parse_bungie_timestamp(guild_config.get("team_raid_last_checked_at"))
         team_seen_instance_ids = set(guild_config.get("team_raid_seen_instance_ids", []))
         new_team_seen = list(guild_config.get("team_raid_seen_instance_ids", []))
+        posted_instance_ids = set(guild_config.get("team_raid_posted_instance_ids", []))
+        new_posted_instance_ids = list(guild_config.get("team_raid_posted_instance_ids", []))
         team_mark_seen_ids = set()
         team_processed_instance_ids = set()
         team_recent_historic_candidates = []
 
-        for player in watched:
+        fetch_semaphore = asyncio.Semaphore(self.player_fetch_concurrency)
+
+        async def fetch_player_completions(player: dict):
             player_name = player.get("global_name", "Guardian")
-            try:
-                completions = await self.detect_new_team_raid_completions(
-                    player,
-                    team_seen_instance_ids,
-                    watched_membership_map,
-                    team_processed_instance_ids,
-                )
-            except Exception as e:
-                print(f"Team raid check failed for {player_name} in guild {guild.id}: {e}")
-                continue
+            async with fetch_semaphore:
+                try:
+                    completions = await self.detect_new_team_raid_completions(
+                        player,
+                        team_seen_instance_ids,
+                        watched_membership_map,
+                        team_processed_instance_ids,
+                        earliest_relevant_dt=threshold_dt,
+                    )
+                    return player, completions
+                except Exception as e:
+                    print(f"Team raid check failed for {player_name} in guild {guild.id}: {e}")
+                    return player, []
+
+        player_completion_results = await asyncio.gather(*(fetch_player_completions(player) for player in watched))
+
+        for player, completions in player_completion_results:
 
             for completion in completions:
                 instance_id = completion.get("instance_id")
                 if not instance_id or instance_id in team_seen_instance_ids:
+                    continue
+                if instance_id in posted_instance_ids:
+                    team_mark_seen_ids.add(instance_id)
                     continue
 
                 completion_dt = self.parse_bungie_timestamp(completion.get("period"))
@@ -943,10 +1118,19 @@ class TeamRaidTracker:
 
                 if completion_dt <= team_last_checked_dt:
                     if completion_dt >= threshold_dt:
+                        reserved_for_post = False
+                        if instance_id not in posted_instance_ids:
+                            posted_instance_ids.add(instance_id)
+                            new_posted_instance_ids.append(instance_id)
+                            reserved_for_post = True
                         try:
                             await self.post_team_raid_completion(guild, channel_id, completion)
                             team_mark_seen_ids.add(instance_id)
                         except Exception as e:
+                            if reserved_for_post:
+                                posted_instance_ids.discard(instance_id)
+                                if instance_id in new_posted_instance_ids:
+                                    new_posted_instance_ids.remove(instance_id)
                             print(
                                 f"Failed to post recent historic team raid completion (instance {instance_id}) "
                                 f"in guild {guild.id}: {e}"
@@ -956,9 +1140,18 @@ class TeamRaidTracker:
                     continue
 
                 try:
+                    reserved_for_post = False
+                    if instance_id not in posted_instance_ids:
+                        posted_instance_ids.add(instance_id)
+                        new_posted_instance_ids.append(instance_id)
+                        reserved_for_post = True
                     await self.post_team_raid_completion(guild, channel_id, completion)
                     team_mark_seen_ids.add(instance_id)
                 except Exception as e:
+                    if reserved_for_post:
+                        posted_instance_ids.discard(instance_id)
+                        if instance_id in new_posted_instance_ids:
+                            new_posted_instance_ids.remove(instance_id)
                     print(
                         f"Failed to post team raid completion (instance {instance_id}) "
                         f"in guild {guild.id}: {e}"
@@ -972,16 +1165,28 @@ class TeamRaidTracker:
                 candidate_instance_id = candidate_completion.get("instance_id")
                 if not candidate_instance_id or candidate_instance_id in historic_processed_ids:
                     continue
+                if candidate_instance_id in posted_instance_ids:
+                    team_mark_seen_ids.add(candidate_instance_id)
+                    continue
                 if candidate_dt is None or candidate_dt < threshold_dt:
                     team_mark_seen_ids.add(candidate_instance_id)
                     continue
                 if candidate_dt > post_not_before_dt:
                     continue
                 try:
+                    reserved_for_post = False
+                    if candidate_instance_id not in posted_instance_ids:
+                        posted_instance_ids.add(candidate_instance_id)
+                        new_posted_instance_ids.append(candidate_instance_id)
+                        reserved_for_post = True
                     await self.post_team_raid_completion(guild, channel_id, candidate_completion)
                     historic_processed_ids.add(candidate_instance_id)
                     team_mark_seen_ids.add(candidate_instance_id)
                 except Exception as e:
+                    if reserved_for_post:
+                        posted_instance_ids.discard(candidate_instance_id)
+                        if candidate_instance_id in new_posted_instance_ids:
+                            new_posted_instance_ids.remove(candidate_instance_id)
                     print(
                         f"Failed to post historic team raid completion (instance {candidate_instance_id}) "
                         f"in guild {guild.id}: {e}"
@@ -995,5 +1200,6 @@ class TeamRaidTracker:
                     new_team_seen.append(instance_id)
 
         guild_config["team_raid_seen_instance_ids"] = new_team_seen[-500:]
+        guild_config["team_raid_posted_instance_ids"] = new_posted_instance_ids[-5000:]
         self.rules_config[str(guild.id)] = guild_config
         self.save_rules_config(self.rules_config)

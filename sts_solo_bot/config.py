@@ -27,7 +27,6 @@ SOLO_ACTIVITY_MODES = [82, 84, 63, 88, 7, 0]
 # Restrict this bot to Seal Team Six guild(s) only.
 ALLOWED_GUILD_IDS = {
     "738885128385855498",
-    "1546957591068934294",
 }
 
 

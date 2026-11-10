@@ -102,6 +102,7 @@ SPECIAL_SOLO_ACTIVITY_NAMES = {
 
 SPECIAL_SOLO_ACTIVITY_KEYWORDS = (
     "pinnacle",
+    "conquest",
     "exotic mission",
     "operation: seraph's shield",
     "seraph's shield",

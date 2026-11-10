@@ -2,6 +2,7 @@
 import unicodedata
 import re
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 import discord
 from discord import app_commands
@@ -30,10 +31,31 @@ from .embeds import build_solo_embed, format_duration, format_int_stat
 from .storage import get_guild_config, load_config, parse_bungie_timestamp, save_config
 
 
-bot = commands.Bot(command_prefix="/", intents=discord.Intents(guilds=True, members=True))
+intents = discord.Intents(guilds=True, members=True)
+intents.message_content = True
+bot = commands.Bot(command_prefix="/", intents=intents)
 rules_config = load_config()
 bungie_api = None
 startup_solo_scan_done = False
+
+
+def sanitize_thumbnail_url(raw_url) -> str | None:
+    raw = str(raw_url or "").strip().strip("<>")
+    if not raw:
+        return None
+
+    if raw.startswith("//"):
+        raw = f"https:{raw}"
+
+    normalized = normalize_bungie_image_url(raw)
+    if not normalized:
+        return None
+
+    parsed = urlparse(normalized)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+
+    return normalized
 
 
 DUNGEON_NAMES = {
@@ -221,39 +243,60 @@ def resolve_dungeon_image_by_name(dungeon_name: str, guild_config):
         text = str(value or "").casefold().strip()
         if not text:
             return ""
-        text = re.sub(r"^the\s+", "", text)
         text = re.sub(r"^exotic\s+mission\s*-\s*", "", text)
-        text = re.sub(r"\s*:\s*(customize|standard)\b", "", text)
+        text = re.sub(r"\s*:\s*(customize|standard|normal|master|legend|expert)\b", "", text)
         text = re.sub(r"\s*\((normal|master|legend|expert|customize|standard)\)\s*$", "", text)
+        text = re.sub(r"^the\s+", "", text)
+        token_set = {token for token in re.findall(r"[a-z0-9]+", text) if token}
+        if {"pit", "heresy"}.issubset(token_set):
+            return "pitofheresy"
+        if {"sundered", "doctrine"}.issubset(token_set):
+            return "sundereddoctrine"
         text = re.sub(r"[^a-z0-9]+", "", text)
         return text
 
     config = guild_config or {}
-    custom_map = (
-        config.get("solo_dungeon_image_by_name")
-        or config.get("team_dungeon_thumbnail_by_name")
-        or config.get("dungeon_thumbnail_by_name")
-        or {}
-    )
+    custom_maps = [
+        config.get("solo_dungeon_image_by_name") or {},
+        config.get("team_dungeon_thumbnail_by_name") or {},
+        config.get("dungeon_thumbnail_by_name") or {},
+    ]
     normalized_target = str(dungeon_name).casefold().strip()
     normalized_target_compact = _normalize_lookup_key(dungeon_name)
     if normalized_target:
-        for key, value in custom_map.items():
-            if not key or not value:
-                continue
-            normalized_key = str(key).casefold().strip()
-            if normalized_key == normalized_target:
-                return str(value)
-            if normalized_target_compact and _normalize_lookup_key(normalized_key) == normalized_target_compact:
-                return str(value)
+        for custom_map in custom_maps:
+            for key, value in custom_map.items():
+                if not key or not value:
+                    continue
+                normalized_key = str(key).casefold().strip()
+                if normalized_key == normalized_target:
+                    return str(value)
+                if normalized_target_compact and _normalize_lookup_key(normalized_key) == normalized_target_compact:
+                    return str(value)
 
-    fallback = config.get("dungeon_embed_image") or DEFAULT_DUNGEON_THUMBNAIL_URL
-    fallback_text = str(fallback or "").strip()
-    return fallback_text or None
+    # Fallback: some activity names include extra prefixes/qualifiers
+    # (e.g. "Grandmaster Conquest - Heliostat"), so match compact keys by containment.
+    if normalized_target_compact:
+        candidates = []
+        for custom_map in custom_maps:
+            for key, value in custom_map.items():
+                if not key or not value:
+                    continue
+                compact_key = _normalize_lookup_key(key)
+                if not compact_key:
+                    continue
+                if compact_key in normalized_target_compact or normalized_target_compact in compact_key:
+                    candidates.append((len(compact_key), str(value)))
+        if candidates:
+            # Prefer the most specific (longest) compact key.
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            return candidates[0][1]
+
+    return None
 
 
 async def resolve_solo_thumbnail_url(dungeon_name: str, guild_config, activity_hash=None):
-    thumbnail_url = resolve_dungeon_image_by_name(dungeon_name, guild_config)
+    thumbnail_url = sanitize_thumbnail_url(resolve_dungeon_image_by_name(dungeon_name, guild_config))
     if thumbnail_url:
         return thumbnail_url
 
@@ -268,7 +311,7 @@ async def resolve_solo_thumbnail_url(dungeon_name: str, guild_config, activity_h
     if activity_hash_int is not None:
         known_name = get_dungeon_name(activity_hash_int)
         if known_name and known_name != "Dungeon":
-            mapped_thumbnail = resolve_dungeon_image_by_name(known_name, guild_config)
+            mapped_thumbnail = sanitize_thumbnail_url(resolve_dungeon_image_by_name(known_name, guild_config))
             if mapped_thumbnail:
                 return mapped_thumbnail
 
@@ -279,17 +322,32 @@ async def resolve_solo_thumbnail_url(dungeon_name: str, guild_config, activity_h
             if display_name:
                 if activity_name_matches_special_solo_activity(display_name):
                     display_name = normalize_special_solo_activity_display_name(display_name)
-                display_name_thumbnail = resolve_dungeon_image_by_name(display_name, guild_config)
+                display_name_thumbnail = sanitize_thumbnail_url(
+                    resolve_dungeon_image_by_name(display_name, guild_config)
+                )
                 if display_name_thumbnail:
                     return display_name_thumbnail
             icon_path = (definition.get("displayProperties") or {}).get("icon")
-            icon_url = normalize_bungie_image_url(icon_path)
+            icon_url = sanitize_thumbnail_url(icon_path)
             if icon_url:
                 return icon_url
         except Exception:
             pass
 
-    return str(DEFAULT_DUNGEON_THUMBNAIL_URL or "").strip() or None
+    config_fallback = sanitize_thumbnail_url((guild_config or {}).get("dungeon_embed_image"))
+    if config_fallback:
+        print(
+            f"[STS_SOLO_THUMBNAIL] Using guild fallback image "
+            f"activity_hash={activity_hash} dungeon={dungeon_name}"
+        )
+        return config_fallback
+
+    default_fallback = sanitize_thumbnail_url(DEFAULT_DUNGEON_THUMBNAIL_URL) or "https://i.postimg.cc/vBbCWrts/Dark-Skull.gif"
+    print(
+        f"[STS_SOLO_THUMBNAIL] Using global fallback image "
+        f"activity_hash={activity_hash} dungeon={dungeon_name}"
+    )
+    return default_fallback
 
 
 def should_hide_status_for_short_exotic_run(activity_name: str | None, duration_seconds) -> bool:
@@ -534,13 +592,25 @@ async def detect_new_solo_dungeon_completions(player, seen_instance_ids):
                     scanned_instance_ids.add(instance_id)
 
                     activity_hash = details.get("referenceId")
-                    if mode is None or mode != 82:
+                    activity_hash_int = None
+                    try:
+                        activity_hash_int = int(activity_hash)
+                    except (TypeError, ValueError):
                         activity_hash_int = None
-                        try:
-                            activity_hash_int = int(activity_hash)
-                        except (TypeError, ValueError):
-                            pass
 
+                    is_special_by_hash = False
+                    if activity_hash_int is not None:
+                        candidate_hashes = {activity_hash_int}
+                        if activity_hash_int < 0:
+                            candidate_hashes.add(activity_hash_int + (1 << 32))
+                        elif activity_hash_int > 0x7FFFFFFF:
+                            candidate_hashes.add(activity_hash_int - (1 << 32))
+                        is_special_by_hash = any(
+                            candidate_hash in SPECIAL_SOLO_ACTIVITY_NAMES
+                            for candidate_hash in candidate_hashes
+                        )
+
+                    if mode is None or mode != 82:
                         activity_name = activity_name_cache.get(activity_hash_int)
                         if activity_name is None and activity_hash_int is not None:
                             try:
@@ -550,7 +620,7 @@ async def detect_new_solo_dungeon_completions(player, seen_instance_ids):
                                 activity_name = ""
                             activity_name_cache[activity_hash_int] = activity_name or ""
 
-                        if not activity_name_matches_special_solo_activity(activity_name):
+                        if not is_special_by_hash and not activity_name_matches_special_solo_activity(activity_name):
                             continue
 
                     values = activity.get("values", {})
@@ -610,6 +680,14 @@ async def post_solo_completion(guild: discord.Guild, channel_id: str, player, co
     if getattr(channel, "guild", None) is None or channel.guild.id != guild.id:
         return
 
+    instance_id = str(completion.get("instance_id") or "").strip()
+    if instance_id:
+        latest_guild_config = get_guild_config(rules_config, guild.id)
+        latest_posted_ids = set(latest_guild_config.get("dungeon_posted_instance_ids", []))
+        if instance_id in latest_posted_ids:
+            print(f"[STS_SOLO] Skipping duplicate solo completion instance_id={instance_id} guild={guild.id}")
+            return
+
     player_name = player.get("global_name", "Guardian")
     dungeon_name = await resolve_activity_name(completion.get("activity_hash"))
     guild_config = get_guild_config(rules_config, guild.id)
@@ -637,6 +715,15 @@ async def post_solo_completion(guild: discord.Guild, channel_id: str, player, co
 
 
 async def run_solo_check_for_guild(guild: discord.Guild):
+    return await run_solo_check_for_guild_with_cache(guild)
+
+
+async def run_solo_check_for_guild_with_cache(
+    guild: discord.Guild,
+    watched_override=None,
+    completions_cache=None,
+    cache_seen_instance_ids=None,
+):
     if not is_allowed_guild(guild.id):
         return
 
@@ -646,7 +733,7 @@ async def run_solo_check_for_guild(guild: discord.Guild):
         return
 
     # STS mode: clan roster only (no server-member scanning).
-    watched = await get_clan_watch_players()
+    watched = watched_override if watched_override is not None else await get_clan_watch_players()
     if not watched:
         return
 
@@ -661,7 +748,21 @@ async def run_solo_check_for_guild(guild: discord.Guild):
     mark_posted_ids = set()
 
     for player in watched:
-        completions = await detect_new_solo_dungeon_completions(player, posted_instance_ids)
+        player_key = (
+            str(player.get("membership_type") or ""),
+            str(player.get("membership_id") or ""),
+        )
+        completions = None
+        if completions_cache is not None and player_key in completions_cache:
+            completions = completions_cache[player_key]
+        if completions is None:
+            detection_seen_ids = posted_instance_ids
+            if cache_seen_instance_ids is not None:
+                detection_seen_ids = cache_seen_instance_ids
+            completions = await detect_new_solo_dungeon_completions(player, detection_seen_ids)
+            if completions_cache is not None:
+                completions_cache[player_key] = completions
+
         for completion in completions:
             instance_id = completion.get("instance_id")
             if (
@@ -713,10 +814,32 @@ async def run_solo_check_for_guild(guild: discord.Guild):
 async def solo_loop():
     if bungie_api is None:
         return
-    print(f"[STS_SOLO_LOOP] Starting cycle for {len(bot.guilds)} guild(s)")
-    for guild in bot.guilds:
+
+    allowed_guilds = [guild for guild in bot.guilds if is_allowed_guild(guild.id)]
+    print(f"[STS_SOLO_LOOP] Starting cycle for {len(allowed_guilds)} guild(s)")
+    if not allowed_guilds:
+        print("[STS_SOLO_LOOP] No allowed guilds in this bot session")
+        return
+
+    watched = await get_clan_watch_players()
+    if not watched:
+        print("[STS_SOLO_LOOP] No clan watch players resolved for this cycle")
+        return
+
+    posted_union = set()
+    for guild in allowed_guilds:
+        guild_config = get_guild_config(rules_config, guild.id)
+        posted_union.update(guild_config.get("dungeon_posted_instance_ids", []))
+
+    completions_cache = {}
+    for guild in allowed_guilds:
         try:
-            await run_solo_check_for_guild(guild)
+            await run_solo_check_for_guild_with_cache(
+                guild,
+                watched_override=watched,
+                completions_cache=completions_cache,
+                cache_seen_instance_ids=posted_union,
+            )
         except Exception as e:
             print(f"[STS_SOLO_LOOP] Guild {guild.id} failed: {e}")
     print("[STS_SOLO_LOOP] Cycle complete")
@@ -782,9 +905,22 @@ async def on_ready():
         print(f"Failed to sync command tree: {e}")
 
     if not startup_solo_scan_done:
-        for guild in bot.guilds:
+        allowed_guilds = [guild for guild in bot.guilds if is_allowed_guild(guild.id)]
+        watched = await get_clan_watch_players()
+        posted_union = set()
+        for guild in allowed_guilds:
+            guild_config = get_guild_config(rules_config, guild.id)
+            posted_union.update(guild_config.get("dungeon_posted_instance_ids", []))
+        completions_cache = {}
+
+        for guild in allowed_guilds:
             try:
-                await run_solo_check_for_guild(guild)
+                await run_solo_check_for_guild_with_cache(
+                    guild,
+                    watched_override=watched,
+                    completions_cache=completions_cache,
+                    cache_seen_instance_ids=posted_union,
+                )
             except Exception as e:
                 print(f"Startup solo check failed for guild {guild.id}: {e}")
         startup_solo_scan_done = True

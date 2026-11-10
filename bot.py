@@ -1,9 +1,11 @@
 import os
 import json
 import re
+import random
 import unicodedata
 import asyncio
 import io
+import traceback
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
@@ -19,6 +21,8 @@ from guardian_rank import GuardianRankCommands
 from raid_roles import RaidRoleManager
 from dungeon_team import TeamDungeonTracker
 from raid_team import TeamRaidTracker
+from weekly_reset_intelligence import WeeklyResetIntelligence
+from raid_weapons_embed import build_raid_weapons_embed, get_raid_weapon_choices
 from pinnacle_ops import (
     SPECIAL_SOLO_ACTIVITY_NAMES,
     activity_name_matches_special_solo_activity,
@@ -46,10 +50,10 @@ async def main():
 
 bungie_api = None
 SOLO_CHECK_INTERVAL_MINUTES = int(os.getenv("SOLO_CHECK_INTERVAL_MINUTES", "2"))
-TEAM_ACTIVITY_CHECK_INTERVAL_MINUTES = int(os.getenv("TEAM_ACTIVITY_CHECK_INTERVAL_MINUTES", "5"))
+TEAM_ACTIVITY_CHECK_INTERVAL_MINUTES = int(os.getenv("TEAM_ACTIVITY_CHECK_INTERVAL_MINUTES", "2"))
 SOLO_POST_DELAY_MINUTES = max(0, int(os.getenv("SOLO_POST_DELAY_MINUTES", "1")))
 TEAM_DUNGEON_POST_DELAY_MINUTES = max(0, int(os.getenv("TEAM_DUNGEON_POST_DELAY_MINUTES", "3")))
-TEAM_RAID_POST_DELAY_MINUTES = max(0, int(os.getenv("TEAM_RAID_POST_DELAY_MINUTES", "3")))
+TEAM_RAID_POST_DELAY_MINUTES = max(0, int(os.getenv("TEAM_RAID_POST_DELAY_MINUTES", "1")))
 DUNGEON_HISTORY_COUNT = int(os.getenv("DUNGEON_HISTORY_COUNT", "50"))
 SOLO_HISTORY_MAX_PAGES = max(1, int(os.getenv("SOLO_HISTORY_MAX_PAGES", "3")))
 RAID_HISTORY_COUNT = int(os.getenv("RAID_HISTORY_COUNT", str(DUNGEON_HISTORY_COUNT)))
@@ -61,10 +65,25 @@ INITIAL_BASELINE_POST_WINDOW_SECONDS = 6 * 60 * 60
 SOLO_DEBUG_LOGS = os.getenv("SOLO_DEBUG_LOGS", "0").strip() in {"1", "true", "yes", "on"}
 SOLO_POST_CHECKPOINTS = os.getenv("SOLO_POST_CHECKPOINTS", "0").strip().casefold() in {"1", "true", "yes", "on"}
 SOLO_MAX_POSTS_PER_CYCLE = max(1, int(os.getenv("SOLO_MAX_POSTS_PER_CYCLE", "10")))
+SOLO_PLAYER_CONCURRENCY = max(1, int(os.getenv("SOLO_PLAYER_CONCURRENCY", "4")))
 BOT_NICKNAME = os.getenv("BOT_NICKNAME", "Wheelie Bin").strip()
 BOT_USERNAME = os.getenv("BOT_USERNAME", "Wheelie Bin").strip()
 startup_solo_scan_done = False
 startup_solo_scan_task = None
+extensions_loaded = False
+
+
+async def load_extensions():
+    # This points to lost_sectors_cog.py
+    if "lost_sectors_cog" not in bot.extensions:
+        await bot.load_extension("lost_sectors_cog")
+    if "bungie_tracker" not in bot.extensions:
+        await bot.load_extension("bungie_tracker")
+    if "clock" not in bot.extensions:
+        try:
+            await bot.load_extension("clock")
+        except Exception as e:
+            print(f"Failed to load extension clock: {e}")
 
 
 def solo_debug(message: str):
@@ -91,11 +110,6 @@ def format_int_stat(value):
         return str(int(value))
     except (TypeError, ValueError):
         return None
-
-
-def should_hide_status_for_short_exotic_run(activity_name: str | None, duration_seconds) -> bool:
-    name_text = str(activity_name or "").casefold().strip()
-    return name_text.startswith("exotic mission -")
 
 
 def load_rules_config():
@@ -153,6 +167,15 @@ def is_allowed_guild_id(guild_id: int | str | None):
 
 def iter_allowed_guilds():
     return [guild for guild in bot.guilds if is_allowed_guild_id(guild.id)]
+
+
+async def guild_scope_interaction_check(interaction: discord.Interaction):
+    return is_allowed_guild_id(interaction.guild_id)
+
+
+# Older discord.py builds in this environment expose interaction_check but not
+# tree-level check decorators/helpers. Assign directly for compatibility.
+bot.tree.interaction_check = guild_scope_interaction_check
 
 
 def get_effective_welcome_settings(
@@ -251,7 +274,68 @@ DUNGEON_NAMES = {
 
     # Sundered Doctrine
     247869137: "Sundered Doctrine",
+
+    # Equilibrium
+    2727361621: "Equilibrium",
+    -1567605675: "Equilibrium",
+    1754635208: "Equilibrium",
 }
+
+
+SOLO_DUNGEON_TEXT_LINES = {
+    "dungeon_flawless": [
+        "Not a single death. Dungeon audited and closed.",
+        "Flawless and fearless. The dungeon had no answers.",
+        "No wipes, no mercy, no survivors.",
+        "Deathless run. Controller still in one piece.",
+        "No wipes, no panic, just violence.",
+        "Flawless execution. The dungeon had no chance.",
+    ],
+    "dungeon_non_flawless": [
+        "A little scuffed, a lot legendary.",
+        "A few bruises, still a solo victory.",
+        "Stayed with it and got the solo done.",
+        "A few setbacks, still a great solo clear.",
+        "Scuffed? Sure. Cleared? Absolutely.",
+    ],
+    "exotic_flawless": [
+        "Deathless exotic run. Someone tell the Vanguard.",
+        "Flawless exotic clear. No notes.",
+        "Zero deaths, maximum flex.",
+        "Clean exotic mission. Bosses taking emotional damage.",
+        "Boss deleted. Guardian unscuffed.",
+    ],
+    "exotic_non_flawless": [
+        "Scuffed the route, still got the clear.",
+        "Not flawless, still cinematic.",
+        "A little chaos, mission still complete.",
+        "Respawns happened. Victory happened too.",
+        "A little chaos, a lot of damage.",
+        "A hard-fought solo clear. Great resilience.",
+    ],
+}
+
+
+def _normalize_lookup_text(value: str):
+    return "".join(ch for ch in str(value or "").casefold() if ch.isalnum())
+
+
+def build_solo_activity_announcement_line(is_exotic_mission: bool, is_flawless: bool):
+    if is_exotic_mission:
+        key = "exotic_flawless" if is_flawless else "exotic_non_flawless"
+    else:
+        key = "dungeon_flawless" if is_flawless else "dungeon_non_flawless"
+
+    options = [str(line).strip() for line in SOLO_DUNGEON_TEXT_LINES.get(key, []) if str(line).strip()]
+    if not options:
+        fallback_map = {
+            "dungeon_flawless": "Flawless run. Incredible consistency.",
+            "dungeon_non_flawless": "Tough clear, strong finish.",
+            "exotic_flawless": "Flawless exotic run. Great execution.",
+            "exotic_non_flawless": "Mission complete. Great solo effort.",
+        }
+        return fallback_map.get(key)
+    return random.choice(options)
 
 
 # Automatic default thresholds for classifying full clears vs checkpoint clears.
@@ -268,6 +352,7 @@ DUNGEON_FULL_CLEAR_MIN_SECONDS_BY_NAME = {
     "Warlord's Ruin": 660,
     "Vesper's Host": 660,
     "Sundered Doctrine": 660,
+    "Equilibrium": 660,
     "Presage": 900,
 }
 
@@ -339,16 +424,28 @@ async def resolve_activity_name(reference_id, guild_config=None):
     if bungie_api is None:
         return f"Dungeon ({activity_hash})"
 
-    try:
-        definition = await bungie_api.get_activity_definition(activity_hash)
-    except Exception:
-        return f"Dungeon ({activity_hash})"
+    candidate_hashes = [activity_hash]
+    if activity_hash < 0:
+        candidate_hashes.append(activity_hash + (1 << 32))
+    elif activity_hash > 0x7FFFFFFF:
+        candidate_hashes.append(activity_hash - (1 << 32))
 
-    display_name = (definition.get("displayProperties") or {}).get("name")
-    if display_name:
-        if activity_name_matches_special_solo_activity(display_name):
-            return normalize_special_solo_activity_display_name(display_name)
-        return display_name
+    for candidate_hash in candidate_hashes:
+        mapped_name = get_dungeon_name(candidate_hash, guild_config=guild_config)
+        if mapped_name:
+            return mapped_name
+
+        try:
+            definition = await bungie_api.get_activity_definition(candidate_hash)
+        except Exception:
+            continue
+
+        display_name = (definition.get("displayProperties") or {}).get("name")
+        if display_name:
+            if activity_name_matches_special_solo_activity(display_name):
+                return normalize_special_solo_activity_display_name(display_name)
+            return display_name
+
     return f"Dungeon ({activity_hash})"
 
 
@@ -599,16 +696,31 @@ def resolve_raid_thumbnail_by_name(raid_name: str, guild_config):
     if not raid_name:
         return None
 
+    def _normalize_lookup_key(value: str):
+        text = str(value or "").casefold().strip()
+        if not text:
+            return ""
+
+        # Normalize known Pantheon label typos so legacy config keys still match.
+        text = text.replace("resplendant", "resplendent")
+        text = text.replace("insurrectiopn", "insurrection")
+        text = re.sub(r"[^a-z0-9]+", "", text)
+        return text
+
     raid_map = (guild_config or {}).get("team_raid_thumbnail_by_name") or {}
     normalized_target = str(raid_name).casefold().strip()
     if not normalized_target:
         return None
+    normalized_target_compact = _normalize_lookup_key(raid_name)
 
     for key, value in raid_map.items():
         if not key or not value:
             continue
-        if str(key).casefold().strip() == normalized_target:
-            return str(value)
+        normalized_key = str(key).casefold().strip()
+        if normalized_key == normalized_target:
+            return str(value).strip()
+        if normalized_target_compact and _normalize_lookup_key(normalized_key) == normalized_target_compact:
+            return str(value).strip()
     return None
 
 
@@ -621,33 +733,60 @@ def resolve_dungeon_image_by_name(dungeon_name: str, guild_config):
         if not text:
             return ""
         text = re.sub(r"^exotic\s+mission\s*-\s*", "", text)
+        text = re.sub(r"^dungeon\s+", "", text)
         text = re.sub(r"\s*:\s*(customize|standard|normal|master|legend|expert)\b", "", text)
         text = re.sub(r"\s*\((normal|master|legend|expert|customize|standard)\)\s*$", "", text)
+        text = re.sub(r"^the\s+", "", text)
+        token_set = {token for token in re.findall(r"[a-z0-9]+", text) if token}
+        if {"pit", "heresy"}.issubset(token_set):
+            return "pitofheresy"
+        if (
+            {"sundered", "doctrine"}.issubset(token_set)
+            or {"dungeonsundered", "doctrine"}.issubset(token_set)
+        ):
+            return "sundereddoctrine"
         text = re.sub(r"[^a-z0-9]+", "", text)
         return text
 
     config = guild_config or {}
-    # Prefer explicit solo map, then shared dungeon maps, then legacy global image.
-    custom_map = (
-        config.get("solo_dungeon_image_by_name")
-        or config.get("team_dungeon_thumbnail_by_name")
-        or config.get("dungeon_thumbnail_by_name")
-        or {}
-    )
+    # Check each map in priority order; do not stop at the first non-empty map.
+    custom_maps = [
+        config.get("solo_dungeon_image_by_name") or {},
+        config.get("team_dungeon_thumbnail_by_name") or {},
+        config.get("dungeon_thumbnail_by_name") or {},
+    ]
     normalized_target = str(dungeon_name).casefold().strip()
     normalized_target_compact = _normalize_lookup_key(dungeon_name)
     if normalized_target:
-        for key, value in custom_map.items():
-            if not key or not value:
-                continue
-            normalized_key = str(key).casefold().strip()
-            if normalized_key == normalized_target:
-                return str(value)
-            if normalized_target_compact and _normalize_lookup_key(normalized_key) == normalized_target_compact:
-                return str(value)
+        for custom_map in custom_maps:
+            for key, value in custom_map.items():
+                if not key or not value:
+                    continue
+                normalized_key = str(key).casefold().strip()
+                if normalized_key == normalized_target:
+                    return str(value)
+                if normalized_target_compact and _normalize_lookup_key(normalized_key) == normalized_target_compact:
+                    return str(value)
 
-    fallback = config.get("dungeon_embed_image")
-    return str(fallback) if fallback else None
+    # Fallback: some activity names include extra prefixes/qualifiers
+    # (e.g. "Grandmaster Conquest - Heliostat"), so match compact keys by containment.
+    if normalized_target_compact:
+        candidates = []
+        for custom_map in custom_maps:
+            for key, value in custom_map.items():
+                if not key or not value:
+                    continue
+                compact_key = _normalize_lookup_key(key)
+                if not compact_key:
+                    continue
+                if compact_key in normalized_target_compact or normalized_target_compact in compact_key:
+                    candidates.append((len(compact_key), str(value).strip()))
+        if candidates:
+            # Prefer the most specific (longest) compact key.
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            return candidates[0][1]
+
+    return None
 
 
 def is_default_solo_thumbnail_url(url: str | None, guild_config=None):
@@ -686,6 +825,11 @@ async def resolve_solo_thumbnail_url(dungeon_name: str, guild_config, activity_h
     if activity_hash_int is not None and bungie_api is not None:
         try:
             definition = await bungie_api.get_activity_definition(activity_hash_int)
+            display_name = (definition.get("displayProperties") or {}).get("name")
+            if display_name:
+                mapped_from_definition = resolve_dungeon_image_by_name(display_name, guild_config)
+                if mapped_from_definition:
+                    return mapped_from_definition
             icon_path = (definition.get("displayProperties") or {}).get("icon")
             icon_url = normalize_bungie_image_url(icon_path)
             if icon_url:
@@ -850,6 +994,16 @@ guardian_rank_commands = GuardianRankCommands(
 )
 guardian_rank_commands.register_commands()
 
+weekly_reset_intelligence = WeeklyResetIntelligence(
+    bot=bot,
+    get_bungie_api=lambda: bungie_api,
+    get_guild_config=get_guild_config,
+    rules_config=rules_config,
+    save_rules_config=save_rules_config,
+    golden_oldies_guild_id=GOLDEN_OLDIES_GUILD_ID,
+)
+weekly_reset_intelligence.register_commands()
+
 
 
 
@@ -863,15 +1017,20 @@ def build_dungeon_embed(
     guild_config,
     thumbnail_url: str | None = None,
 ):
-    is_exotic_mission = str(dungeon_name or "").casefold().startswith("exotic mission -")
+    dungeon_name_text = str(dungeon_name or "").casefold()
+    is_exotic_mission = dungeon_name_text.startswith("exotic mission -")
+    if "kell's fall" in dungeon_name_text or "kells fall" in dungeon_name_text:
+        is_exotic_mission = False
     embed_color = discord.Color.gold() if is_flawless else discord.Color.orange()
+    announcement_line = build_solo_activity_announcement_line(is_exotic_mission, is_flawless)
     if is_solo and is_flawless:
-        description = f"Flawless solo by {player_name}! No deaths, no mercy."
+        description = f"Solo flawless by {player_name}."
+        if announcement_line:
+            description = f"{description} {announcement_line}"
     elif is_solo:
-        if is_exotic_mission:
-            description = f"{player_name} finished the exotic mission with some scars, but got it done."
-        else:
-            description = f"{player_name} solo cleared the dungeon with some scars, but got it done."
+        description = f"Solo clear by {player_name}."
+        if announcement_line:
+            description = f"{description} {announcement_line}"
     else:
         return None  # Don't show embeds for team clears
 
@@ -888,7 +1047,23 @@ def build_dungeon_embed(
     if thumbnail_url:
         embed.set_thumbnail(url=thumbnail_url)
 
+    embed.set_footer(text="via Wheelie Bin")
+
     return embed
+
+
+def add_verified_ultimate_label(activity_name: str, difficulty_tier) -> str:
+    try:
+        is_ultimate_tier = int(difficulty_tier) == 11
+    except (TypeError, ValueError):
+        is_ultimate_tier = False
+
+    if not is_ultimate_tier or not str(activity_name or "").casefold().startswith("operation: seraph's shield"):
+        return activity_name
+
+    base_name = re.sub(r"\s*\([^)]*\)\s*$", "", activity_name).strip()
+    base_name = re.sub(r":\s*(?:customize|standard|legend|expert)\s*$", "", base_name, flags=re.IGNORECASE).strip()
+    return f"{base_name} (Ultimate)"
 
 
 
@@ -1058,6 +1233,24 @@ async def detect_new_solo_dungeon_completions(player, seen_instance_ids, min_per
 
                     scanned_instance_ids.add(instance_id)
                     activity_hash = details.get("referenceId")
+                    activity_hash_int = None
+                    try:
+                        activity_hash_int = int(activity_hash)
+                    except (TypeError, ValueError):
+                        activity_hash_int = None
+
+                    is_special_by_hash = False
+                    if activity_hash_int is not None:
+                        candidate_hashes = {activity_hash_int}
+                        if activity_hash_int < 0:
+                            candidate_hashes.add(activity_hash_int + (1 << 32))
+                        elif activity_hash_int > 0x7FFFFFFF:
+                            candidate_hashes.add(activity_hash_int - (1 << 32))
+                        is_special_by_hash = any(
+                            candidate_hash in SPECIAL_SOLO_ACTIVITY_NAMES
+                            for candidate_hash in candidate_hashes
+                        )
+
                     period = activity.get("period")
                     completion_dt = parse_bungie_timestamp(period)
 
@@ -1067,12 +1260,6 @@ async def detect_new_solo_dungeon_completions(player, seen_instance_ids, min_per
                         continue
 
                     if mode is None:
-                        activity_hash_int = None
-                        try:
-                            activity_hash_int = int(activity_hash)
-                        except (TypeError, ValueError):
-                            pass
-
                         activity_name = activity_name_cache.get(activity_hash_int)
                         if activity_name is None and activity_hash_int is not None:
                             try:
@@ -1082,15 +1269,9 @@ async def detect_new_solo_dungeon_completions(player, seen_instance_ids, min_per
                                 activity_name = ""
                             activity_name_cache[activity_hash_int] = activity_name or ""
 
-                        if not activity_name_matches_special_solo_activity(activity_name):
+                        if not is_special_by_hash and not activity_name_matches_special_solo_activity(activity_name):
                             continue
                     elif mode != 82:
-                        activity_hash_int = None
-                        try:
-                            activity_hash_int = int(activity_hash)
-                        except (TypeError, ValueError):
-                            pass
-
                         activity_name = activity_name_cache.get(activity_hash_int)
                         if activity_name is None and activity_hash_int is not None:
                             try:
@@ -1100,7 +1281,7 @@ async def detect_new_solo_dungeon_completions(player, seen_instance_ids, min_per
                                 activity_name = ""
                             activity_name_cache[activity_hash_int] = activity_name or ""
 
-                        if not activity_name_matches_special_solo_activity(activity_name):
+                        if not is_special_by_hash and not activity_name_matches_special_solo_activity(activity_name):
                             continue
 
                     values = activity.get("values", {})
@@ -1126,6 +1307,19 @@ async def detect_new_solo_dungeon_completions(player, seen_instance_ids, min_per
                         except (TypeError, ValueError):
                             return False
 
+                    def entry_failed(entry):
+                        reason = (
+                            entry.get("values", {})
+                            .get("completionReason", {})
+                            .get("basic", {})
+                        )
+                        display_value = str(reason.get("displayValue") or "").strip().casefold()
+                        try:
+                            reason_value = float(reason.get("value"))
+                        except (TypeError, ValueError):
+                            reason_value = None
+                        return display_value == "failed" or reason_value == 2
+
                     completed_entries = [entry for entry in entries if entry_completed(entry)]
                     completed_membership_ids = {
                         str(
@@ -1150,6 +1344,37 @@ async def detect_new_solo_dungeon_completions(player, seen_instance_ids, min_per
                         .get("destinyUserInfo", {})
                         .get("membershipId")
                     }
+
+                    player_entries = [
+                        entry
+                        for entry in entries
+                        if str(
+                            (entry.get("player", {})
+                            .get("destinyUserInfo", {})
+                            .get("membershipId", ""))
+                        ).strip() == player_membership_id
+                    ]
+                    relevant_entries = player_entries or (entries if len(entries) == 1 else [])
+                    if any(entry_failed(entry) for entry in relevant_entries):
+                        solo_debug(
+                            f"Skipping failed activity instance={instance_id} "
+                            f"player={player_membership_id}"
+                        )
+                        continue
+
+                    if player_entries:
+                        player_completed = any(entry_completed(entry) for entry in player_entries)
+                    elif len(entries) == 1:
+                        player_completed = entry_completed(entries[0])
+                    else:
+                        player_completed = False
+
+                    if not player_completed:
+                        solo_debug(
+                            f"Skipping player-incomplete instance {instance_id} "
+                            f"player={player_membership_id}"
+                        )
+                        continue
 
                     if participant_membership_ids:
                         is_solo = participant_membership_ids == {player_membership_id}
@@ -1204,6 +1429,7 @@ async def detect_new_solo_dungeon_completions(player, seen_instance_ids, min_per
                             "instance_id": instance_id,
                             "period": period,
                             "activity_hash": details.get("referenceId"),
+                            "activity_difficulty_tier": pgcr.get("activityDifficultyTier"),
                             "flawless": is_flawless,
                             "solo": is_solo,
                             "deaths": deaths_value,
@@ -1271,11 +1497,138 @@ async def get_auto_watch_players_for_clan():
     return players
 
 
+async def get_profile_watch_players_for_guild(guild_config):
+    async def _resolve_profile_reference(profile_ref: dict):
+        membership_type = profile_ref.get("membership_type")
+        membership_id = profile_ref.get("membership_id")
+        if not membership_id or membership_type is None:
+            return None
+
+        try:
+            membership_type_int = int(membership_type)
+        except (TypeError, ValueError):
+            return None
+
+        # Bungie profile links often use membership type 254, which is not
+        # directly valid for Destiny2/{membershipType}/Profile lookups.
+        # Resolve to a concrete platform profile first.
+        if membership_type_int not in {1, 2, 3}:
+            if bungie_api is None:
+                return None
+            try:
+                linked = await bungie_api._get(
+                    f"/Destiny2/{membership_type_int}/Profile/{membership_id}/LinkedProfiles/"
+                )
+            except Exception:
+                linked = {}
+
+            linked_profiles = list((linked or {}).get("profiles") or [])
+            if linked_profiles:
+                primary_profile = None
+                for profile in linked_profiles:
+                    if profile.get("isCrossSavePrimary"):
+                        primary_profile = profile
+                        break
+                chosen_profile = primary_profile or linked_profiles[0]
+                resolved_membership_id = str(chosen_profile.get("membershipId") or "").strip()
+                resolved_membership_type = chosen_profile.get("membershipType")
+                if resolved_membership_id and resolved_membership_type is not None:
+                    try:
+                        membership_type_int = int(resolved_membership_type)
+                        membership_id = resolved_membership_id
+                    except (TypeError, ValueError):
+                        return None
+                else:
+                    return None
+            else:
+                return None
+
+        return await resolve_player_from_membership(
+            membership_id,
+            membership_type_int,
+            display_name="Guardian",
+        )
+
+    players = []
+    for item in list((guild_config or {}).get("dungeon_watch_profiles", []) or []):
+        profile_ref = parse_bungie_profile_input(str(item))
+        if profile_ref is None:
+            continue
+        try:
+            resolved = await _resolve_profile_reference(profile_ref)
+        except Exception:
+            resolved = None
+        if resolved:
+            players.append(resolved)
+    return players
+
+
+def merge_unique_players(*player_groups):
+    merged = []
+    seen = set()
+    for group in player_groups:
+        for player in group or []:
+            key = (
+                str(player.get("membership_type") or ""),
+                str(player.get("membership_id") or ""),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(player)
+    return merged
+
+
 def get_solo_watch_scope(guild_config):
     configured = str((guild_config or {}).get("solo_watch_scope", "")).strip().casefold()
     if configured in {"server", "clan", "manual"}:
         return configured
     return "clan" if BUNGIE_CLAN_ID else "manual"
+
+
+def normalize_golden_oldies_solo_activity_name(guild_id: int | str | None, activity_name: str | None):
+    if str(guild_id or "") != str(GOLDEN_OLDIES_GUILD_ID or ""):
+        return activity_name
+
+    text = str(activity_name or "").strip()
+    if not text:
+        return activity_name
+
+    lowered = text.casefold()
+    if "pantheon" not in lowered:
+        return activity_name
+
+    # Pantheon track labeling for Golden Oldies.
+    calus_resplendent_tokens = {
+        "calus resplendent",
+        "argos",
+        "gahlran",
+        "emperor calus",
+    }
+    morgeth_surpassing_tokens = {
+        "morgeth surpassing",
+        "warpriest",
+        "consecrated mind",
+        "morgeth",
+    }
+    insurrection_revolutionary_tokens = {
+        "insurrection prime revolutionary",
+        "insurrection prime",
+    }
+
+    for token in calus_resplendent_tokens:
+        if token in lowered:
+            return "Calus Resplendent"
+
+    for token in morgeth_surpassing_tokens:
+        if token in lowered:
+            return "Morgeth Surpassing"
+
+    for token in insurrection_revolutionary_tokens:
+        if token in lowered:
+            return "Insurrection Prime Revolutionary"
+
+    return "Pantheon"
 
 
 async def get_server_watch_players_for_guild(guild: discord.Guild):
@@ -1364,40 +1717,75 @@ async def get_server_watch_players_for_guild(guild: discord.Guild):
 
 async def get_team_watched_players_for_guild(guild_config, guild: discord.Guild | None = None):
     scope = get_solo_watch_scope(guild_config)
+    profile_players = await get_profile_watch_players_for_guild(guild_config)
+    manual_players = list((guild_config or {}).get("dungeon_watch", []) or [])
+
     if scope == "server":
         server_players = await get_server_watch_players_for_guild(guild)
-        if server_players:
-            return server_players
-        # Fallback when Discord->Bungie name resolution yields no players.
+        merged_players = merge_unique_players(server_players, profile_players)
+        seen_memberships = {
+            (
+                str(player.get("membership_type") or ""),
+                str(player.get("membership_id") or ""),
+            )
+            for player in merged_players
+        }
+
+        # In server scope, include clan roster as a safety net so clan-only
+        # members (or difficult Discord-name matches) are still watched.
         if BUNGIE_CLAN_ID:
             try:
-                return await get_auto_watch_players_for_clan()
+                clan_players = await get_auto_watch_players_for_clan()
             except Exception as e:
                 print(f"Failed fallback clan roster for server watch scope: {e}")
-        return list((guild_config or {}).get("dungeon_watch", []) or [])
+                clan_players = []
+
+            for player in clan_players:
+                membership_key = (
+                    str(player.get("membership_type") or ""),
+                    str(player.get("membership_id") or ""),
+                )
+                if membership_key in seen_memberships:
+                    continue
+                seen_memberships.add(membership_key)
+                merged_players.append(player)
+
+        if merged_players:
+            return merged_players
+
+        return merge_unique_players(
+            manual_players,
+            profile_players,
+        )
 
     if scope == "clan" and BUNGIE_CLAN_ID:
         try:
-            return await get_auto_watch_players_for_clan()
+            clan_players = await get_auto_watch_players_for_clan()
+            return merge_unique_players(clan_players, profile_players)
         except Exception as e:
             print(f"Failed to fetch clan roster for watched players: {e}")
-            return []
+            fallback_server_players = await get_server_watch_players_for_guild(guild)
+            return merge_unique_players(fallback_server_players, manual_players, profile_players)
 
-    return list((guild_config or {}).get("dungeon_watch", []) or [])
+    return merge_unique_players(
+        manual_players,
+        profile_players,
+    )
 
 
 async def post_solo_completion(guild: discord.Guild, channel_id: str, player, completion):
+    guild_config = get_guild_config(guild.id)
+
     try:
         channel = await bot.fetch_channel(int(channel_id))
     except Exception as e:
-        print(f"Failed to fetch dungeon channel for guild {guild.id}: {e}")
+        print(f"Failed to fetch solo channel for guild {guild.id}: {e}")
         return
 
     if getattr(channel, "guild", None) is None or channel.guild.id != guild.id:
         print(f"Dungeon channel mismatch for guild {guild.id}")
         return
 
-    guild_config = get_guild_config(guild.id)
     player_name = player.get("global_name", "Guardian")
     if (not player_name or str(player_name).strip().casefold() == "guardian") and bungie_api is not None:
         membership_id = player.get("membership_id")
@@ -1421,10 +1809,15 @@ async def post_solo_completion(guild: discord.Guild, channel_id: str, player, co
 
     player_avatar = normalize_bungie_image_url(player.get("avatar_url"))
     dungeon_name = await resolve_activity_name(completion.get("activity_hash"), guild_config=guild_config)
+    dungeon_name = normalize_golden_oldies_solo_activity_name(guild.id, dungeon_name)
     thumbnail_url = await resolve_solo_thumbnail_url(
         dungeon_name,
         guild_config,
         completion.get("activity_hash"),
+    )
+    dungeon_name = add_verified_ultimate_label(
+        dungeon_name,
+        completion.get("activity_difficulty_tier"),
     )
     if not thumbnail_url:
         print(
@@ -1439,7 +1832,6 @@ async def post_solo_completion(guild: discord.Guild, channel_id: str, player, co
     is_flawless = completion.get("flawless", False)
     is_solo = completion.get("solo", False)
     duration_seconds = completion.get("duration_seconds")
-
     # Use Bungie's exact checkpoint field instead of time heuristic
     was_started_from_beginning = completion.get("was_started_from_beginning", True)
     is_checkpoint = not was_started_from_beginning
@@ -1467,16 +1859,12 @@ async def post_solo_completion(guild: discord.Guild, channel_id: str, player, co
     deaths_value = completion.get("deaths")
     duration_text = format_duration(duration_seconds)
 
-    status = "Full" if was_started_from_beginning else "Checkpoint"
     kills_text = format_int_stat(kills_value) or "—"
     deaths_text = format_int_stat(deaths_value) or "—"
     time_text = duration_text or "—"
-    hide_status = should_hide_status_for_short_exotic_run(dungeon_name, duration_seconds)
     embed.add_field(name="Kills", value=kills_text, inline=True)
     embed.add_field(name="Deaths", value=deaths_text, inline=True)
     embed.add_field(name="Time", value=time_text, inline=True)
-    if not hide_status:
-        embed.add_field(name="Status", value=status, inline=True)
 
     await channel.send(embed=embed)
     solo_debug(
@@ -1515,6 +1903,22 @@ async def run_solo_check_for_guild(guild: discord.Guild):
     threshold_dt = check_started_at - timedelta(seconds=INITIAL_BASELINE_POST_WINDOW_SECONDS)
     post_not_before_dt = check_started_at - timedelta(minutes=SOLO_POST_DELAY_MINUTES)
 
+    fetch_semaphore = asyncio.Semaphore(SOLO_PLAYER_CONCURRENCY)
+
+    async def fetch_player_completions(player: dict):
+        player_name = player.get("global_name", "Guardian")
+        async with fetch_semaphore:
+            try:
+                completions = await detect_new_solo_dungeon_completions(
+                    player,
+                    posted_instance_ids,
+                    min_period_dt=threshold_dt,
+                )
+                return player, completions
+            except Exception as e:
+                print(f"Solo check failed for {player_name} in guild {guild.id}: {e}")
+                return player, []
+
     def persist_seen_instance(instance_id: str):
         if not instance_id:
             return
@@ -1536,17 +1940,10 @@ async def run_solo_check_for_guild(guild: discord.Guild):
         rules_config[str(guild.id)] = guild_config
         save_rules_config(rules_config)
 
-    for player in watched:
+    player_completion_results = await asyncio.gather(*(fetch_player_completions(player) for player in watched))
+
+    for player, completions in player_completion_results:
         player_name = player.get("global_name", "Guardian")
-        try:
-            completions = await detect_new_solo_dungeon_completions(
-                player,
-                posted_instance_ids,
-                min_period_dt=threshold_dt,
-            )
-        except Exception as e:
-            print(f"Solo check failed for {player_name} in guild {guild.id}: {e}")
-            continue
 
         for completion in completions:
             instance_id = completion.get("instance_id")
@@ -1599,7 +1996,8 @@ async def run_solo_check_for_guild(guild: discord.Guild):
                         f"Recent historic candidate instance={instance_id} "
                         f"completion_dt={completion_dt} player={player_name}"
                     )
-                    if posted_this_cycle >= SOLO_MAX_POSTS_PER_CYCLE:
+                    is_priority_completion = bool(completion.get("flawless"))
+                    if posted_this_cycle >= SOLO_MAX_POSTS_PER_CYCLE and not is_priority_completion:
                         solo_debug(
                             f"Deferring instance={instance_id} due to SOLO_MAX_POSTS_PER_CYCLE="
                             f"{SOLO_MAX_POSTS_PER_CYCLE}"
@@ -1625,7 +2023,8 @@ async def run_solo_check_for_guild(guild: discord.Guild):
                     mark_seen_ids.add(instance_id)
                 continue
 
-            if posted_this_cycle >= SOLO_MAX_POSTS_PER_CYCLE:
+            is_priority_completion = bool(completion.get("flawless"))
+            if posted_this_cycle >= SOLO_MAX_POSTS_PER_CYCLE and not is_priority_completion:
                 solo_debug(
                     f"Deferring instance={instance_id} due to SOLO_MAX_POSTS_PER_CYCLE="
                     f"{SOLO_MAX_POSTS_PER_CYCLE}"
@@ -1665,7 +2064,8 @@ async def run_solo_check_for_guild(guild: discord.Guild):
                     mark_seen_ids.add(candidate_instance_id)
                     persist_seen_instance(candidate_instance_id)
                 continue
-            if posted_this_cycle >= SOLO_MAX_POSTS_PER_CYCLE:
+            is_priority_completion = bool(candidate_completion.get("flawless"))
+            if posted_this_cycle >= SOLO_MAX_POSTS_PER_CYCLE and not is_priority_completion:
                 continue
             try:
                 await post_solo_completion(guild, channel_id, candidate_player, candidate_completion)
@@ -1721,6 +2121,7 @@ async def run_solo_check_for_guild(guild: discord.Guild):
 
 async def run_team_activity_check_for_guild(guild: discord.Guild):
     guild_config = get_guild_config(guild.id)
+    check_started_at = datetime.now(timezone.utc)
     team_channel_id = guild_config.get("team_dungeon_channel_id")
     team_raid_channel_id = guild_config.get("team_raid_channel_id")
 
@@ -1728,24 +2129,91 @@ async def run_team_activity_check_for_guild(guild: discord.Guild):
     if not team_channel_id and not team_raid_channel_id:
         return
 
-    watched = await get_team_watched_players_for_guild(guild_config, guild=guild)
+    try:
+        watched = await asyncio.wait_for(
+            get_team_watched_players_for_guild(guild_config, guild=guild),
+            timeout=45,
+        )
+    except asyncio.TimeoutError:
+        print(f"[TEAM_ACTIVITY_CHECK] Watched roster lookup timed out for guild {guild.id}", flush=True)
+        watched = []
+    except Exception as e:
+        print(f"[TEAM_ACTIVITY_CHECK] Watched roster lookup failed for guild {guild.id}: {e}", flush=True)
+        watched = []
 
-    if not watched:
-        return
+    if watched:
+        print(
+            f"[TEAM_ACTIVITY_CHECK] Resolved watched roster for guild {guild.id} size={len(watched)}",
+            flush=True,
+        )
+        guild_config["team_watch_cache"] = watched
+        guild_config["team_watch_cache_updated_at"] = datetime.now(timezone.utc).isoformat()
+        rules_config[str(guild.id)] = guild_config
+        save_rules_config(rules_config)
+    else:
+        cached_watched = list(guild_config.get("team_watch_cache") or [])
+        if cached_watched:
+            print(
+                f"[TEAM_ACTIVITY_CHECK] Using cached watched roster for guild {guild.id} "
+                f"(size={len(cached_watched)})",
+                flush=True,
+            )
+            watched = cached_watched
+        else:
+            print(f"[TEAM_ACTIVITY_CHECK] No watched players resolved for guild {guild.id}", flush=True)
+            return
 
+    team_tasks = []
+    team_labels = []
     if team_channel_id:
-        await team_dungeon_tracker.run_team_check_for_guild(
-            guild=guild,
-            channel_id=team_channel_id,
-            watched=watched,
+        team_labels.append("dungeon")
+        team_tasks.append(
+            asyncio.wait_for(
+                team_dungeon_tracker.run_team_check_for_guild(
+                    guild=guild,
+                    channel_id=team_channel_id,
+                    watched=watched,
+                ),
+                timeout=240,
+            )
         )
 
     if team_raid_channel_id:
-        await team_raid_tracker.run_team_raid_check_for_guild(
-            guild=guild,
-            channel_id=team_raid_channel_id,
-            watched=watched,
+        team_labels.append("raid")
+        team_tasks.append(
+            asyncio.wait_for(
+                team_raid_tracker.run_team_raid_check_for_guild(
+                    guild=guild,
+                    channel_id=team_raid_channel_id,
+                    watched=watched,
+                ),
+                timeout=240,
+            )
         )
+
+    if team_tasks:
+        print(
+            f"[TEAM_ACTIVITY_CHECK] Starting team checks for guild {guild.id} "
+            f"tasks={','.join(team_labels)} watched={len(watched)}",
+            flush=True,
+        )
+        results = await asyncio.gather(*team_tasks, return_exceptions=True)
+        for index, result in enumerate(results):
+            if isinstance(result, asyncio.TimeoutError):
+                print(
+                    f"[TEAM_ACTIVITY_CHECK] {team_labels[index]} check timed out for guild {guild.id}",
+                    flush=True,
+                )
+            elif isinstance(result, Exception):
+                print(
+                    f"[TEAM_ACTIVITY_CHECK] {team_labels[index]} check failed for guild {guild.id}: {result}",
+                    flush=True,
+                )
+        print(f"[TEAM_ACTIVITY_CHECK] Finished team checks for guild {guild.id}", flush=True)
+
+    guild_config["team_activity_last_attempt_at"] = check_started_at.isoformat()
+    rules_config[str(guild.id)] = guild_config
+    save_rules_config(rules_config)
 
 
 async def run_startup_solo_scan_once():
@@ -1766,6 +2234,7 @@ async def run_startup_solo_scan_once():
 async def solo_dungeon_check_loop():
     if bungie_api is None:
         return
+    loop_started = datetime.now(timezone.utc)
     active_guilds = iter_allowed_guilds()
     print(f"[SOLO_LOOP] Starting cycle for {len(active_guilds)} guild(s)", flush=True)
     for guild in active_guilds:
@@ -1773,7 +2242,8 @@ async def solo_dungeon_check_loop():
             await run_solo_check_for_guild(guild)
         except Exception as e:
             print(f"[SOLO_LOOP] Guild {guild.id} failed: {e}", flush=True)
-    print("[SOLO_LOOP] Cycle complete", flush=True)
+    elapsed = datetime.now(timezone.utc) - loop_started
+    print(f"[SOLO_LOOP] Cycle complete duration={elapsed.total_seconds():.1f}s", flush=True)
 
 
 @solo_dungeon_check_loop.before_loop
@@ -1785,8 +2255,18 @@ async def before_solo_dungeon_check_loop():
 async def team_activity_check_loop():
     if bungie_api is None:
         return
-    for guild in iter_allowed_guilds():
-        await run_team_activity_check_for_guild(guild)
+    loop_started = datetime.now(timezone.utc)
+    active_guilds = iter_allowed_guilds()
+    print(f"[TEAM_ACTIVITY_LOOP] Starting cycle for {len(active_guilds)} guild(s)", flush=True)
+    for guild in active_guilds:
+        try:
+            await asyncio.wait_for(run_team_activity_check_for_guild(guild), timeout=300)
+        except asyncio.TimeoutError:
+            print(f"[TEAM_ACTIVITY_LOOP] Guild {guild.id} timed out after 300s", flush=True)
+        except Exception as e:
+            print(f"[TEAM_ACTIVITY_LOOP] Guild {guild.id} failed: {e}", flush=True)
+    elapsed = datetime.now(timezone.utc) - loop_started
+    print(f"[TEAM_ACTIVITY_LOOP] Cycle complete duration={elapsed.total_seconds():.1f}s", flush=True)
 
 
 @team_activity_check_loop.before_loop
@@ -1906,7 +2386,16 @@ async def on_ready():
     global bungie_api
     global startup_solo_scan_done
     global startup_solo_scan_task
+    global extensions_loaded
     print(f'Logged in as {bot.user}!', flush=True)
+
+    if not extensions_loaded:
+        try:
+            await load_extensions()
+            extensions_loaded = True
+            print("Loaded extension: lost_sectors_cog", flush=True)
+        except Exception as e:
+            print(f"Failed to load extensions: {e}", flush=True)
 
     if ALLOWED_GUILD_IDS:
         print(f"Guild isolation enabled: {sorted(ALLOWED_GUILD_IDS)}", flush=True)
@@ -1944,20 +2433,49 @@ async def on_ready():
             except Exception as e:
                 print(f"Failed to set nickname in guild {guild.id}: {e}", flush=True)
 
-    # Sync commands early so Discord reflects adds/removals immediately,
-    # even if startup solo scans take a while.
-    try:
-        synced = await asyncio.wait_for(bot.tree.sync(), timeout=20)
-        print(f'Synced {len(synced)} global command(s)')
+    # Start weekly reset automation before command sync to avoid startup delays.
+    weekly_reset_intelligence.start()
 
-        # Remove any old guild-scoped copies so Discord only shows one command set.
-        for guild in iter_allowed_guilds():
-            bot.tree.clear_commands(guild=guild)
-            guild_synced = await asyncio.wait_for(bot.tree.sync(guild=guild), timeout=20)
-            print(
-                f'Cleared guild-specific command copies for {guild.name} '
-                f'({guild.id}); now {len(guild_synced)} guild command(s)'
-            )
+    # Sync commands early so Discord reflects adds/removals immediately.
+    # Prefer guild-targeted sync for reliable availability in active servers.
+    try:
+        app_id = bot.application_id
+        if app_id is not None:
+            # Remove global registrations to avoid mixed global+guild behavior.
+            try:
+                global_commands = await bot.tree.fetch_commands()
+                removed = 0
+                for command in global_commands:
+                    await bot.http.delete_global_command(app_id, int(command.id))
+                    removed += 1
+                print(f'Removed {removed} global command(s)', flush=True)
+            except Exception as global_cleanup_error:
+                print(f'Failed to clear global commands: {global_cleanup_error}', flush=True)
+
+        for guild in bot.guilds:
+            try:
+                bot.tree.copy_global_to(guild=guild)
+                guild_synced = await bot.tree.sync(guild=guild)
+                print(f'Synced {len(guild_synced)} guild command(s) for {guild.name} ({guild.id})', flush=True)
+            except Exception as guild_sync_error:
+                print(
+                    f'Failed to sync guild commands for {guild.id} '
+                    f'({type(guild_sync_error).__name__}): {guild_sync_error!r}',
+                    flush=True,
+                )
+                try:
+                    guild_synced = await bot.tree.sync(guild=guild)
+                    print(
+                        f'Retry sync succeeded with {len(guild_synced)} guild command(s) '
+                        f'for {guild.name} ({guild.id})',
+                        flush=True,
+                    )
+                except Exception as retry_sync_error:
+                    print(
+                        f'Retry sync failed for guild {guild.id} '
+                        f'({type(retry_sync_error).__name__}): {retry_sync_error!r}',
+                        flush=True,
+                    )
 
         # Defensive cleanup: explicitly remove deprecated commands if Discord
         # still keeps stale registrations after normal sync.
@@ -1965,12 +2483,6 @@ async def on_ready():
         try:
             app_id = bot.application_id
             if app_id is not None:
-                global_commands = await bot.tree.fetch_commands()
-                for command in global_commands:
-                    if str(getattr(command, "name", "")) in stale_command_names:
-                        await bot.http.delete_global_command(app_id, int(command.id))
-                        print(f"Removed stale global command: {command.name}")
-
                 for guild in iter_allowed_guilds():
                     guild_commands = await bot.tree.fetch_commands(guild=guild)
                     for command in guild_commands:
@@ -1990,19 +2502,20 @@ async def on_ready():
         if not BUNGIE_CLAN_ID:
             print("BUNGIE_CLAN_ID is missing. Set it for automatic clan-wide solo tracking.")
 
-        # Run startup scan before starting loops to avoid duplicate posts
-        # caused by overlapping startup/task-loop processing.
-        if not startup_solo_scan_done:
-            try:
-                await run_startup_solo_scan_once()
-            except Exception as e:
-                print(f"Startup solo scan failed: {e}")
-
         if not solo_dungeon_check_loop.is_running():
             solo_dungeon_check_loop.start()
         if not team_activity_check_loop.is_running():
             team_activity_check_loop.start()
         guardian_rank_commands.start()
+
+        # Startup scan is best-effort only; don't block recurring loops.
+        if not startup_solo_scan_done:
+            try:
+                await asyncio.wait_for(run_startup_solo_scan_once(), timeout=90)
+            except asyncio.TimeoutError:
+                print("Startup solo scan timed out after 90s; continuing with active loops.")
+            except Exception as e:
+                print(f"Startup solo scan failed: {e}")
 
     fallback_channel_id = os.getenv('RULES_CHANNEL_ID')
     fallback_guild_id = None
@@ -2074,6 +2587,7 @@ async def on_member_join(member):
             color=discord.Color.gold()
         )
         embed.set_thumbnail(url=member.display_avatar.url)
+        embed.set_footer(text="via Wheelie Bin")
         image_url = resolve_welcome_image_url(guild_config)
 
         attachment, filename = await build_embed_image_attachment(image_url, fallback_name="welcome-logo")
@@ -2084,6 +2598,30 @@ async def on_member_join(member):
             if image_url:
                 embed.set_image(url=image_url)
             await channel.send(embed=embed)
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    command_name = getattr(getattr(interaction, "command", None), "name", "unknown")
+    print(f"[APP_CMD_ERROR] command={command_name} error={type(error).__name__}: {error}", flush=True)
+    print("".join(traceback.format_exception(type(error), error, error.__traceback__)), flush=True)
+
+    if isinstance(error, app_commands.MissingPermissions):
+        message = "You do not have permission to use this command."
+    elif isinstance(error, app_commands.CheckFailure):
+        message = "Command check failed for your current role/context."
+    elif isinstance(error, app_commands.CommandOnCooldown):
+        message = f"Command is on cooldown. Try again in {error.retry_after:.1f}s."
+    else:
+        message = "Something went wrong while running that command."
+
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except Exception:
+        pass
 
 # Reaction-based rules agreement
 @bot.event
@@ -2154,11 +2692,6 @@ async def on_raw_reaction_remove(payload):
     await raid_role_manager.handle_raid_reaction_remove(payload, guild_rules)
 
 
-@bot.tree.check
-async def guild_scope_check(interaction: discord.Interaction):
-    return is_allowed_guild_id(interaction.guild_id)
-
-
 @bot.tree.command(name="test_welcome", description="Test the welcome embed in the current channel.")
 @app_commands.checks.has_permissions(administrator=True)
 async def test_welcome(interaction: discord.Interaction):
@@ -2179,6 +2712,7 @@ async def test_welcome(interaction: discord.Interaction):
         color=discord.Color.gold()
     )
     embed.set_thumbnail(url=member.display_avatar.url)
+    embed.set_footer(text="via Wheelie Bin")
     image_url = resolve_welcome_image_url(guild_config)
 
     attachment, filename = await build_embed_image_attachment(image_url, fallback_name="welcome-logo")
@@ -2505,6 +3039,70 @@ async def unset_team_raid_channel(interaction: discord.Interaction):
 
 
 @bot.tree.command(
+    name="set_raid_weapon_channel",
+    description="Set the default channel for /raid_weapons posts.",
+)
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(channel="Optional channel ID, #mention, or name. Leave empty to use this channel.")
+async def set_raid_weapon_channel(
+    interaction: discord.Interaction,
+    channel: str | None = None,
+):
+    if interaction.guild_id is None:
+        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message("Could not determine the server context.", ephemeral=True)
+        return
+
+    target_channel = resolve_text_channel_from_input(guild, channel)
+    if target_channel is None:
+        current_channel = interaction.channel
+        if isinstance(current_channel, discord.TextChannel) and (channel is None or not str(channel).strip()):
+            target_channel = current_channel
+
+    if target_channel is None or target_channel.guild.id != interaction.guild_id:
+        await interaction.response.send_message(
+            "Could not find that text channel. Use a channel ID, #mention, exact name, or run the command in the target channel with no argument.",
+            ephemeral=True,
+        )
+        return
+
+    guild_config = get_guild_config(interaction.guild_id)
+    guild_config["raid_weapon_channel_id"] = str(target_channel.id)
+    rules_config[str(interaction.guild_id)] = guild_config
+    save_rules_config(rules_config)
+    await interaction.response.send_message(
+        f"Raid weapon channel set to {target_channel.mention}.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="unset_raid_weapon_channel",
+    description="Unset the default channel for /raid_weapons posts.",
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def unset_raid_weapon_channel(interaction: discord.Interaction):
+    if interaction.guild_id is None:
+        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+        return
+
+    guild_config = get_guild_config(interaction.guild_id)
+    if "raid_weapon_channel_id" in guild_config:
+        guild_config.pop("raid_weapon_channel_id", None)
+        rules_config[str(interaction.guild_id)] = guild_config
+        save_rules_config(rules_config)
+
+    await interaction.response.send_message(
+        "Raid weapon channel has been unset.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
     name="set_dungeon_full_clear_seconds",
     description="Set the minimum runtime (seconds) treated as a full clear; lower is treated as checkpoint clear.")
 @app_commands.checks.has_permissions(administrator=True)
@@ -2604,6 +3202,7 @@ async def post_latest_solo_embed(
         return
 
     dungeon_name = await resolve_activity_name(completion.get("activity_hash"), guild_config=guild_config)
+    dungeon_name = normalize_golden_oldies_solo_activity_name(interaction.guild_id, dungeon_name)
     flawless = bool(completion.get("flawless", False))
     checkpoint = not bool(completion.get("was_started_from_beginning", True))
     player_name = resolved_player.get("global_name") or str(gamertag).strip()
@@ -2613,6 +3212,10 @@ async def post_latest_solo_embed(
         dungeon_name,
         guild_config,
         completion.get("activity_hash"),
+    )
+    dungeon_name = add_verified_ultimate_label(
+        dungeon_name,
+        completion.get("activity_difficulty_tier"),
     )
     if not thumbnail_url:
         print(
@@ -2633,13 +3236,9 @@ async def post_latest_solo_embed(
     kills_text = format_int_stat(completion.get("kills")) or "—"
     deaths_text = format_int_stat(completion.get("deaths")) or "—"
     time_text = format_duration(completion.get("duration_seconds")) or "—"
-    status_text = "Checkpoint" if checkpoint else "Full"
-    hide_status = should_hide_status_for_short_exotic_run(dungeon_name, completion.get("duration_seconds"))
     embed.add_field(name="Kills", value=kills_text, inline=True)
     embed.add_field(name="Deaths", value=deaths_text, inline=True)
     embed.add_field(name="Time", value=time_text, inline=True)
-    if not hide_status:
-        embed.add_field(name="Status", value=status_text, inline=True)
 
     await target_channel.send(embed=embed)
 
@@ -2714,6 +3313,7 @@ async def test_raid_embed(
         color=discord.Color.gold(),
     )
     embed.set_thumbnail(url=thumbnail_url)
+    embed.set_footer(text="via Wheelie Bin")
     await interaction.response.send_message(embed=embed)
 
 
@@ -2809,6 +3409,153 @@ async def test_team_dungeon_post(
 
 
 @bot.tree.command(
+    name="backfill_team_dungeons",
+    description="Backfill missed team dungeon posts from the last X minutes.",
+)
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(
+    minutes="How far back to scan for missed completions (default: 180)",
+    channel="Optional channel for backfill posts (defaults to configured team dungeon channel)",
+)
+async def backfill_team_dungeons(
+    interaction: discord.Interaction,
+    minutes: app_commands.Range[int, 10, 1440] = 180,
+    channel: discord.TextChannel | None = None,
+):
+    if interaction.guild_id is None:
+        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message("Could not determine the server context.", ephemeral=True)
+        return
+
+    guild_config = get_guild_config(interaction.guild_id)
+    target_channel = channel
+    if target_channel is None:
+        configured_channel_id = guild_config.get("team_dungeon_channel_id") or guild_config.get("dungeon_channel_id")
+        if configured_channel_id:
+            try:
+                fetched_channel = await bot.fetch_channel(int(configured_channel_id))
+                if isinstance(fetched_channel, discord.TextChannel):
+                    target_channel = fetched_channel
+            except Exception:
+                target_channel = None
+
+    if target_channel is None:
+        target_channel = interaction.channel
+
+    if not isinstance(target_channel, discord.TextChannel):
+        await interaction.response.send_message(
+            "Please use this command in a text channel or provide a text channel.",
+            ephemeral=True,
+        )
+        return
+
+    if target_channel.guild.id != interaction.guild_id:
+        await interaction.response.send_message(
+            "The selected channel must be in this server.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    watched = await get_team_watched_players_for_guild(guild_config, guild=guild)
+    if not watched:
+        await interaction.followup.send("No watched players resolved for this guild.", ephemeral=True)
+        return
+
+    lookback_dt = datetime.now(timezone.utc) - timedelta(minutes=int(minutes))
+    watched_membership_map = {
+        str(player.get("membership_id")): player.get("global_name", "Guardian")
+        for player in watched
+        if player.get("membership_id")
+    }
+
+    posted_instance_ids = set(guild_config.get("dungeon_team_posted_instance_ids", []))
+    seen_instance_ids = set(guild_config.get("dungeon_team_seen_instance_ids", []))
+    new_posted_instance_ids = list(guild_config.get("dungeon_team_posted_instance_ids", []))
+    new_team_seen = list(guild_config.get("dungeon_team_seen_instance_ids", []))
+    processed_instance_ids = set()
+    fetch_semaphore = asyncio.Semaphore(team_dungeon_tracker.player_fetch_concurrency)
+
+    async def fetch_player_completions(player: dict):
+        player_name = player.get("global_name", "Guardian")
+        async with fetch_semaphore:
+            try:
+                completions = await team_dungeon_tracker.detect_new_team_dungeon_completions(
+                    player,
+                    set(),
+                    watched_membership_map,
+                    processed_instance_ids,
+                    earliest_relevant_dt=lookback_dt,
+                )
+                return completions
+            except Exception as e:
+                print(f"Team dungeon backfill failed for {player_name} in guild {guild.id}: {e}")
+                return []
+
+    completion_batches = await asyncio.gather(*(fetch_player_completions(player) for player in watched))
+    completion_by_instance = {}
+    for completions in completion_batches:
+        for completion in completions:
+            instance_id = completion.get("instance_id")
+            if not instance_id:
+                continue
+            completion_by_instance[instance_id] = completion
+
+    ordered_completions = sorted(
+        completion_by_instance.values(),
+        key=lambda item: parse_bungie_timestamp(item.get("period")) or datetime.min.replace(tzinfo=timezone.utc),
+    )
+
+    posted_count = 0
+    skipped_existing = 0
+    skipped_old = 0
+    failed_count = 0
+
+    for completion in ordered_completions:
+        instance_id = completion.get("instance_id")
+        completion_dt = parse_bungie_timestamp(completion.get("period"))
+        if not instance_id or completion_dt is None:
+            continue
+        if completion_dt < lookback_dt:
+            skipped_old += 1
+            continue
+        if instance_id in posted_instance_ids:
+            skipped_existing += 1
+            continue
+
+        try:
+            await team_dungeon_tracker.post_team_completion(guild, str(target_channel.id), completion)
+            posted_count += 1
+            posted_instance_ids.add(instance_id)
+            seen_instance_ids.add(instance_id)
+            new_posted_instance_ids.append(instance_id)
+            new_team_seen.append(instance_id)
+        except Exception as e:
+            failed_count += 1
+            print(f"Team dungeon backfill post failed for instance {instance_id} in guild {guild.id}: {e}")
+
+    guild_config["dungeon_team_last_checked_at"] = datetime.now(timezone.utc).isoformat()
+    guild_config["dungeon_team_seen_instance_ids"] = new_team_seen[-500:]
+    guild_config["dungeon_team_posted_instance_ids"] = new_posted_instance_ids[-5000:]
+    rules_config[str(interaction.guild_id)] = guild_config
+    save_rules_config(rules_config)
+
+    await interaction.followup.send(
+        (
+            f"Backfill complete for last **{minutes}** minute(s) in {target_channel.mention}.\n"
+            f"Posted: **{posted_count}** | Already posted: **{skipped_existing}** | "
+            f"Too old: **{skipped_old}** | Failed: **{failed_count}**"
+        ),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
     name="test_team_raid_post",
     description="Post a real team raid completion message from a Bungie gamertag.",
 )
@@ -2887,7 +3634,10 @@ async def test_team_raid_post(
         )
         return
 
-    raid_name = await resolve_activity_name(completion.get("activity_hash"), guild_config=guild_config)
+    raid_name = await team_raid_tracker.resolve_raid_name(
+        completion.get("activity_hash"),
+        guild_config=guild_config,
+    )
     completion["difficulty"] = await team_raid_tracker.resolve_raid_difficulty_label(
         completion.get("activity_hash"),
         raid_name,
@@ -2899,6 +3649,73 @@ async def test_team_raid_post(
         await target_channel.send(embed=embed)
     await interaction.response.send_message(
         f"Posted real team raid data for {player.get('global_name', str(gamertag).strip())} to {target_channel.mention}.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="raid_weapons",
+    description="Show raid weapons and where they drop by encounter.",
+)
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(
+    raid="Raid to show weapon drops for",
+    channel="Optional channel to post in (defaults to this channel)",
+)
+@app_commands.choices(
+    raid=[
+        app_commands.Choice(name=choice_name, value=choice_value)
+        for choice_name, choice_value in get_raid_weapon_choices()
+    ]
+)
+async def raid_weapons(
+    interaction: discord.Interaction,
+    raid: app_commands.Choice[str],
+    channel: discord.TextChannel | None = None,
+):
+    if interaction.guild_id is None:
+        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+        return
+
+    guild_config = get_guild_config(interaction.guild_id)
+    target_channel = channel
+    if target_channel is None:
+        configured_channel_id = guild_config.get("raid_weapon_channel_id")
+        if configured_channel_id:
+            try:
+                fetched_channel = await bot.fetch_channel(int(configured_channel_id))
+                if isinstance(fetched_channel, discord.TextChannel):
+                    target_channel = fetched_channel
+            except Exception:
+                target_channel = None
+
+    if target_channel is None:
+        target_channel = interaction.channel
+    if not isinstance(target_channel, discord.TextChannel):
+        await interaction.response.send_message(
+            "Please use this command in a text channel or provide a text channel.",
+            ephemeral=True,
+        )
+        return
+
+    if target_channel.guild.id != interaction.guild_id:
+        await interaction.response.send_message(
+            "The selected channel must be in this server.",
+            ephemeral=True,
+        )
+        return
+
+    embed = build_raid_weapons_embed(raid.value)
+    if embed is None:
+        await interaction.response.send_message(
+            "No raid weapon table found for that raid yet.",
+            ephemeral=True,
+        )
+        return
+
+    await target_channel.send(embed=embed)
+    await interaction.response.send_message(
+        f"Posted raid weapons for **{raid.name}** to {target_channel.mention}.",
         ephemeral=True,
     )
 
@@ -2991,4 +3808,3 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 
 bot.run(TOKEN)
-

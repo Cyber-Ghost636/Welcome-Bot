@@ -11,43 +11,43 @@ This file is a quick reference for running and maintaining the `welcome-bot` sys
 ### Check status
 
 ```bash
-sudo systemctl --no-pager --full status welcome-bot
+systemctl --no-pager --full status welcome-bot
 ```
 
 ### Restart bot
 
 ```bash
-sudo systemctl restart welcome-bot
+systemctl restart welcome-bot
 ```
 
 ### Restart + quick status (recommended)
 
 ```bash
-sudo systemctl restart welcome-bot && sudo systemctl --no-pager --full status welcome-bot | head -n 20
+systemctl restart welcome-bot && systemctl --no-pager --full status welcome-bot | head -n 20
 ```
 
 ### Start bot
 
 ```bash
-sudo systemctl start welcome-bot
+systemctl start welcome-bot
 ```
 
 ### Stop bot
 
 ```bash
-sudo systemctl stop welcome-bot
+systemctl stop welcome-bot
 ```
 
 ### Enable on boot
 
 ```bash
-sudo systemctl enable welcome-bot
+systemctl enable welcome-bot
 ```
 
 ### Disable on boot
 
 ```bash
-sudo systemctl disable welcome-bot
+systemctl disable welcome-bot
 ```
 
 ## Logs
@@ -55,19 +55,19 @@ sudo systemctl disable welcome-bot
 ### Follow live logs
 
 ```bash
-sudo journalctl -u welcome-bot -f
+journalctl -u welcome-bot -f
 ```
 
 ### Show latest 200 lines
 
 ```bash
-sudo journalctl -u welcome-bot -n 200 --no-pager
+journalctl -u welcome-bot -n 200 --no-pager
 ```
 
 ### Show logs since last boot
 
 ```bash
-sudo journalctl -u welcome-bot -b --no-pager
+journalctl -u welcome-bot -b --no-pager
 ```
 
 ## Deploying Code Changes
@@ -77,8 +77,8 @@ Run these after editing code:
 ```bash
 cd /home/wh33ls/Documents/Welcome\ Bot
 ./scripts/pre_restart_check.sh
-sudo systemctl restart welcome-bot
-sudo systemctl --no-pager --full status welcome-bot | head -n 20
+systemctl restart welcome-bot
+systemctl --no-pager --full status welcome-bot | head -n 20
 ```
 
 Then verify in Discord by running your test commands.
@@ -88,8 +88,14 @@ Then verify in Discord by running your test commands.
 Team raid and team dungeon checks now run on a dedicated interval so posts can appear faster than solo checks.
 
 - Env var: `TEAM_ACTIVITY_CHECK_INTERVAL_MINUTES`
-- Default: `5`
+- Default: `2`
 - Lower value = faster posting but more Bungie API traffic
+
+Raid posts also have a freshness delay to avoid posting runs still in progress.
+
+- Env var: `TEAM_RAID_POST_DELAY_MINUTES`
+- Default: `1`
+- Lower value = faster posts, higher chance of near-real-time race conditions
 
 ## Pre-Restart Sanity Check
 
@@ -125,21 +131,35 @@ Optional: show more logs by passing a line count:
 1. Check status:
 
 ```bash
-sudo systemctl --no-pager --full status welcome-bot
+systemctl --no-pager --full status welcome-bot
 ```
 
 2. Check recent logs:
 
 ```bash
-sudo journalctl -u welcome-bot -n 200 --no-pager
+journalctl -u welcome-bot -n 200 --no-pager
 ```
 
 3. If you edited the service file (`/etc/systemd/system/welcome-bot.service`), reload systemd:
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl restart welcome-bot
+systemctl restart welcome-bot
 ```
+
+## Note About Privileges
+
+On this Pi setup, `welcome-bot` can be controlled without `sudo`, which avoids password prompts.
+If your environment requires root for `systemctl` or `journalctl`, use `sudo` for those commands.
+
+Quick check for current terminal context:
+
+```bash
+grep NoNewPrivs /proc/$$/status
+```
+
+- `NoNewPrivs: 1` = restricted session (common in VS Code integrated terminal); `sudo` will fail, use non-sudo commands here.
+- `NoNewPrivs: 0` = normal host terminal; `sudo` works as expected.
 
 ## Optional: Manual Run (Debug)
 
@@ -152,3 +172,5 @@ python bot.py
 ```
 
 Stop with `Ctrl+C`.
+
+/weekly_reset_intel in discord

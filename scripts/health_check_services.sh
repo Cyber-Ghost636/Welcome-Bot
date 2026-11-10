@@ -26,7 +26,7 @@ service_status() {
 print_recent_logs() {
   local svc="$1"
   if systemctl list-unit-files --type=service | awk '{print $1}' | grep -qx "${svc}.service"; then
-    sudo journalctl -u "$svc" -n "$LOG_LINES" --no-pager || true
+    journalctl -u "$svc" -n "$LOG_LINES" --no-pager || true
   else
     echo "Skipping logs: ${svc}.service not found"
   fi

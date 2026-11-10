@@ -39,9 +39,9 @@ chmod +x scripts/install_sts_service.sh
 Useful service commands:
 
 ```bash
-sudo systemctl --no-pager --full status sts-solo-bot
-sudo systemctl restart sts-solo-bot
-sudo journalctl -u sts-solo-bot -f
+systemctl --no-pager --full status sts-solo-bot
+systemctl restart sts-solo-bot
+journalctl -u sts-solo-bot -f
 ```
 
 ## Verified Ops Commands
@@ -57,9 +57,13 @@ systemctl --no-pager status sts-solo-bot.service | head -n 40
 Restart service after code/config changes:
 
 ```bash
-sudo systemctl restart sts-solo-bot.service
+systemctl restart sts-solo-bot.service
 systemctl --no-pager status sts-solo-bot.service | head -n 30
 ```
+
+Note:
+- On this Pi setup, runtime service control works without `sudo`.
+- Keep `sudo` only for install/daemon-reload flows that write to `/etc/systemd/system`.
 
 View recent startup logs after restart:
 

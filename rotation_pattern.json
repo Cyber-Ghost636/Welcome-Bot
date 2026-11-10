@@ -1,0 +1,41 @@
+{
+  "notes": "Weekly rotation memory file. Update after each reset to preserve observed pattern.",
+  "timezone_reference": {
+    "utc_reset": "Tuesday 17:00",
+    "local_reset_example": "Tuesday 18:00 (UTC+1 during BST)"
+  },
+  "tracking": {
+    "last_updated": "2026-10-13",
+    "source": "d2rad + server observations",
+    "status_legend": {
+      "verified": "Confirmed after reset",
+      "predicted": "Expected before reset"
+    }
+  },
+  "weekly_windows": [
+    {
+      "window": "2026-10-06_to_2026-10-13",
+      "raids": ["Salvation's Edge", "Vault of Glass"],
+      "dungeons": ["Warlord's Ruin", "Pit of Heresy"],
+      "status": "verified"
+    },
+    {
+      "window": "2026-10-13_to_2026-10-20",
+      "raids": ["Last Wish", "Vow of the Disciple"],
+      "dungeons": ["Vesper's Host", "Prophecy"],
+      "status": "predicted"
+    },
+    {
+      "window": "2026-10-20_to_2026-10-27",
+      "raids": ["Garden of Salvation", "King's Fall"],
+      "dungeons": ["Sundered Doctrine", "Grasp of Avarice"],
+      "status": "verified"
+    },
+    {
+      "window": "2026-10-27_to_2026-11-03",
+      "raids": ["Deep Stone Crypt", "Root of Nightmares"],
+      "dungeons": ["The Shattered Throne", "Duality"],
+      "status": "verified"
+    }
+  ]
+}

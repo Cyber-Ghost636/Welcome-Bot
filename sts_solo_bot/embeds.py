@@ -1,4 +1,45 @@
 import discord
+import random
+
+
+SOLO_DUNGEON_TEXT_LINES = {
+    "dungeon_flawless": [
+        "Not a single death. Dungeon audited and closed.",
+        "Flawless and fearless. The dungeon had no answers.",
+        "No wipes, no mercy, no survivors.",
+        "Deathless run. Controller still in one piece.",
+    ],
+    "dungeon_non_flawless": [
+        "A little scuffed, a lot legendary.",
+        "A few bruises, still a solo victory.",
+        "Wobbled once, finished strong.",
+        "A few setbacks, still a great solo clear.",
+    ],
+    "exotic_flawless": [
+        "Deathless exotic run. Someone tell the Vanguard.",
+        "Flawless exotic clear. No notes.",
+        "Zero deaths, maximum flex.",
+        "Clean exotic mission. Bosses taking emotional damage.",
+    ],
+    "exotic_non_flawless": [
+        "Scuffed the route, still got the clear.",
+        "Not flawless, still cinematic.",
+        "A little chaos, mission still complete.",
+        "Respawns happened. Victory happened too.",
+    ],
+}
+
+
+def build_solo_activity_announcement_line(is_exotic_mission: bool, is_flawless: bool):
+    if is_exotic_mission:
+        key = "exotic_flawless" if is_flawless else "exotic_non_flawless"
+    else:
+        key = "dungeon_flawless" if is_flawless else "dungeon_non_flawless"
+
+    options = [str(line).strip() for line in SOLO_DUNGEON_TEXT_LINES.get(key, []) if str(line).strip()]
+    if not options:
+        return None
+    return random.choice(options)
 
 
 def format_duration(seconds_value):
@@ -31,13 +72,15 @@ def build_solo_embed(
 ) -> discord.Embed:
     is_exotic_mission = str(dungeon_name or "").casefold().startswith("exotic mission -")
     color = discord.Color.gold() if is_flawless else discord.Color.orange()
+    announcement_line = build_solo_activity_announcement_line(is_exotic_mission, is_flawless)
     if is_flawless:
-        description = f"Flawless solo by {player_name}! Stuffed the boss in a locker and walked out flawless."
+        description = f"Solo flawless by {player_name}."
+        if announcement_line:
+            description = f"{description} {announcement_line}"
     else:
-        if is_exotic_mission:
-            description = f"{player_name} finished the exotic mission with some scars, but got it done."
-        else:
-            description = f"{player_name} solo cleared the dungeon with some scars, but got it done."
+        description = f"Solo clear by {player_name}."
+        if announcement_line:
+            description = f"{description} {announcement_line}"
 
     embed = discord.Embed(
         title=dungeon_name,
@@ -50,4 +93,5 @@ def build_solo_embed(
         embed.set_author(name=player_name)
     if thumbnail_url:
         embed.set_thumbnail(url=thumbnail_url)
+    embed.set_footer(text="#via D2 Solo")
     return embed

@@ -511,7 +511,7 @@ class GuardianRankCommands:
         )
         @discord.app_commands.describe(bungie_name="Bungie name, e.g. WH33LS#8650")
         async def guardian_rank(interaction: discord.Interaction, bungie_name: str):
-            await interaction.response.defer()
+            await interaction.response.defer(ephemeral=True)
 
             bungie_api = self.get_bungie_api()
             if bungie_api is None:
@@ -566,22 +566,25 @@ class GuardianRankCommands:
             if icon_url:
                 embed.set_thumbnail(url=icon_url)
             embed.set_footer(text="via Wheelie Bin")
-            if renewed_rank is not None:
-                renewed_rank_name = self._get_rank_name(int(renewed_rank))
-                embed.add_field(
-                    name="Season Start Rank",
-                    value=f"{renewed_rank} - {renewed_rank_name}",
-                    inline=True,
+            target_channel = interaction.channel
+            if target_channel is None:
+                await interaction.followup.send(
+                    "Couldn't determine a channel to post in.",
+                    ephemeral=True,
                 )
-            if lifetime_rank is not None:
-                lifetime_rank_name = self._get_rank_name(int(lifetime_rank))
-                embed.add_field(
-                    name="Lifetime Highest",
-                    value=f"{lifetime_rank} - {lifetime_rank_name}",
-                    inline=True,
-                )
+                return
 
-            await interaction.followup.send(embed=embed)
+            try:
+                await target_channel.send(embed=embed)
+                try:
+                    await interaction.delete_original_response()
+                except Exception:
+                    pass
+            except Exception:
+                await interaction.followup.send(
+                    "I couldn't post the embed in this channel.",
+                    ephemeral=True,
+                )
 
         @self.bot.tree.command(
             name="set_guardian_rank_channel",

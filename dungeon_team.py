@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import io
+import os
 import re
 from urllib.parse import urlparse
 from datetime import datetime, timedelta, timezone
@@ -8,6 +10,49 @@ from pathlib import Path
 
 import aiohttp
 import discord
+
+
+KNOWN_DUNGEON_NAMES_BY_HASH = {
+    # Shattered Throne
+    1375089621: "Shattered Throne",
+    2032534090: "Shattered Throne",
+    # Pit of Heresy
+    1042180643: "Pit of Heresy",
+    2582501063: "Pit of Heresy",
+    # Prophecy
+    2296816009: "Prophecy",
+    3637651331: "Prophecy",
+    1077850348: "Prophecy",
+    # Grasp of Avarice
+    4078656646: "Grasp of Avarice",
+    # Duality
+    3132816111: "Duality",
+    3635748805: "Duality",
+    1826478593: "Duality",
+    -659218491: "Duality",
+    # Spire of the Watcher
+    422102671: "Spire of the Watcher",
+    1225969316: "Spire of the Watcher",
+    1262462921: "Spire of the Watcher",
+    # Ghosts of the Deep
+    1451777341: "Ghosts of the Deep",
+    1094262727: "Ghosts of the Deep",
+    313828469: "Ghosts of the Deep",
+    # Warlord's Ruin
+    3732368189: "Warlord's Ruin",
+    2004855007: "Warlord's Ruin",
+    -562599107: "Warlord's Ruin",
+    # Vesper's Host
+    3138284691: "Vesper's Host",
+    300092127: "Vesper's Host",
+    -1156682605: "Vesper's Host",
+    # Sundered Doctrine
+    247869137: "Sundered Doctrine",
+    # Equilibrium
+    2727361621: "Equilibrium",
+    -1567605675: "Equilibrium",
+    1754635208: "Equilibrium",
+}
 
 
 class TeamDungeonTracker:
@@ -45,7 +90,9 @@ class TeamDungeonTracker:
         self.initial_baseline_post_window_seconds = int(initial_baseline_post_window_seconds)
         self.post_delay_seconds = max(0, int(post_delay_minutes) * 60)
         self.min_completions = max(2, int(min_completions))
-        self.team_dungeon_activity_modes = [82, 84]
+        self.player_fetch_concurrency = max(1, int(os.getenv("TEAM_PLAYER_CONCURRENCY", "4")))
+        self.history_max_pages = max(1, int(os.getenv("TEAM_DUNGEON_HISTORY_MAX_PAGES", "3")))
+        self.team_dungeon_activity_modes = [82]
         self.activity_icon_cache = {}
         self.class_emoji_by_type = {
             0: ":titan:",
@@ -79,7 +126,7 @@ class TeamDungeonTracker:
         kills_int = self._safe_int(kills) or 0
         deaths_int = self._safe_int(deaths) or 0
         if deaths_int <= 0:
-            return "Inf"
+            return "N/A"
         return f"{kills_int / deaths_int:.2f}"
 
     def _display_name_from_destiny_user(self, destiny_user):
@@ -178,6 +225,7 @@ class TeamDungeonTracker:
             return "Dungeon"
 
         cleaned = str(dungeon_name).strip()
+        cleaned = re.sub(r"^dungeon\s+", "", cleaned, flags=re.IGNORECASE)
         # Remove common difficulty suffix wrappers and separators.
         cleaned = re.sub(r"\s*[:\-]\s*(master|standard)\s*$", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\s*[\(\[]\s*(master|standard)\s*[\)\]]\s*$", "", cleaned, flags=re.IGNORECASE)
@@ -231,39 +279,89 @@ class TeamDungeonTracker:
             or guild_config.get("dungeon_thumbnail_by_name")
             or {}
         )
-        if normalized_name and normalized_name in custom_map and custom_map[normalized_name]:
-            return str(custom_map[normalized_name])
+        def _lookup_custom_thumbnail(name_value: str | None):
+            candidate_name = self._normalize_dungeon_name(name_value or "")
+            if not candidate_name:
+                return None
 
-        # Fuzzy match keys that may differ by suffix/punctuation casing.
-        normalized_lookup = str(normalized_name).casefold().strip()
-        for key, value in custom_map.items():
-            if not key or not value:
-                continue
-            key_normalized = self._normalize_dungeon_name(str(key)).casefold().strip()
-            key_canonical = self._canonical_dungeon_key(str(key))
-            if key_normalized == normalized_lookup:
-                return str(value)
-            if canonical_lookup and key_canonical == canonical_lookup:
-                return str(value)
+            if candidate_name in custom_map and custom_map[candidate_name]:
+                return str(custom_map[candidate_name]).strip()
+
+            candidate_lookup = candidate_name.casefold().strip()
+            candidate_canonical = self._canonical_dungeon_key(candidate_name)
+            for key, value in custom_map.items():
+                if not key or not value:
+                    continue
+                key_normalized = self._normalize_dungeon_name(str(key)).casefold().strip()
+                key_canonical = self._canonical_dungeon_key(str(key))
+                if key_normalized == candidate_lookup:
+                    return str(value).strip()
+                if candidate_canonical and key_canonical == candidate_canonical:
+                    return str(value).strip()
+
+            # Fallback: allow close/extended title variants (e.g. extra suffixes/prefixes)
+            # by matching canonical keys by containment and picking the most specific key.
+            if candidate_canonical:
+                candidates = []
+                for key, value in custom_map.items():
+                    if not key or not value:
+                        continue
+                    key_canonical = self._canonical_dungeon_key(str(key))
+                    if not key_canonical:
+                        continue
+                    if (
+                        key_canonical in candidate_canonical
+                        or candidate_canonical in key_canonical
+                    ):
+                        candidates.append((len(key_canonical), str(value).strip()))
+                if candidates:
+                    candidates.sort(key=lambda item: item[0], reverse=True)
+                    return candidates[0][1]
+            return None
+
+        mapped_thumbnail = _lookup_custom_thumbnail(normalized_name)
+        if mapped_thumbnail:
+            return mapped_thumbnail
 
         # Auto-resolve thumbnail from Bungie activity definition.
         activity_hash_int = self._safe_int(activity_hash)
         if activity_hash_int is not None:
-            if activity_hash_int in self.activity_icon_cache:
-                return self.activity_icon_cache[activity_hash_int]
+            candidate_hashes = {activity_hash_int}
+            if activity_hash_int < 0:
+                candidate_hashes.add(activity_hash_int + (1 << 32))
+            elif activity_hash_int > 0x7FFFFFFF:
+                candidate_hashes.add(activity_hash_int - (1 << 32))
+
+            for candidate_hash in candidate_hashes:
+                known_dungeon_name = KNOWN_DUNGEON_NAMES_BY_HASH.get(candidate_hash)
+                if not known_dungeon_name:
+                    continue
+                mapped_from_hash = _lookup_custom_thumbnail(known_dungeon_name)
+                if mapped_from_hash:
+                    return mapped_from_hash
+
+            for candidate_hash in candidate_hashes:
+                if candidate_hash in self.activity_icon_cache:
+                    return self.activity_icon_cache[candidate_hash]
 
             bungie_api = self.get_bungie_api()
             if bungie_api is not None:
-                try:
-                    definition = await bungie_api.get_activity_definition(activity_hash_int)
+                for candidate_hash in candidate_hashes:
+                    try:
+                        definition = await bungie_api.get_activity_definition(candidate_hash)
+                    except Exception:
+                        continue
+
                     display = definition.get("displayProperties") or {}
+                    display_name = display.get("name")
+                    mapped_from_definition = _lookup_custom_thumbnail(display_name)
+                    if mapped_from_definition:
+                        return mapped_from_definition
                     icon_path = display.get("icon")
                     icon_url = self._normalize_bungie_image_url(icon_path)
                     if icon_url:
-                        self.activity_icon_cache[activity_hash_int] = icon_url
+                        self.activity_icon_cache[candidate_hash] = icon_url
                         return icon_url
-                except Exception:
-                    pass
 
         # Fallback to global team/single-dungeon thumbnail settings.
         return (
@@ -318,12 +416,17 @@ class TeamDungeonTracker:
                 all_completed_ids_ordered.append(membership_id)
 
         if watched_membership_map:
-            selected_completed_ids = sorted(
-                membership for membership in all_completed_membership_ids
+            selected_completed_ids = [
+                membership for membership in all_completed_ids_ordered
                 if membership in watched_membership_map
-            )
+            ]
         else:
-            selected_completed_ids = sorted(all_completed_membership_ids)
+            selected_completed_ids = list(all_completed_ids_ordered)
+
+        # Dungeon fireteams are 3 players; PGCR can contain extra completed
+        # entries due to joins/leaves during the instance.
+        selected_completed_ids = selected_completed_ids[:3]
+        all_completed_ids_ordered = all_completed_ids_ordered[:3]
 
         required_count = max(2, int(min_completions))
         if len(selected_completed_ids) < required_count:
@@ -372,6 +475,7 @@ class TeamDungeonTracker:
                 "membership_type": entry_membership_type,
                 "character_id": entry_character_id,
                 "name": self._display_name_from_destiny_user(destiny_user),
+                "is_watched": entry_membership_id in selected_completed_ids,
                 "class_emoji": class_emoji,
                 "class_name": self.class_name_by_type.get(class_type, "Guardian"),
                 "power": power,
@@ -401,6 +505,7 @@ class TeamDungeonTracker:
                         "membership_type": None,
                         "character_id": "",
                         "name": fallback_name,
+                        "is_watched": True,
                         "class_emoji": ":guardian:",
                         "class_name": "Guardian",
                         "power": None,
@@ -428,6 +533,7 @@ class TeamDungeonTracker:
                         "membership_type": None,
                         "character_id": "",
                         "name": fallback_name,
+                        "is_watched": membership in selected_completed_ids,
                         "class_emoji": ":guardian:",
                         "class_name": "Guardian",
                         "power": None,
@@ -453,8 +559,8 @@ class TeamDungeonTracker:
                 player_data.get("name") or "Guardian"
                 for player_data in ordered_players
             ],
-            "watched_players": ordered_players,
-            "players": ordered_all_players,
+            "watched_players": ordered_players[:3],
+            "players": ordered_all_players[:3],
             "duration_seconds": duration_seconds,
             "was_started_from_beginning": pgcr.get("activityWasStartedFromBeginning", True),
         }
@@ -464,15 +570,21 @@ class TeamDungeonTracker:
         if bungie_api is None or not completion:
             return
 
-        players = completion.get("watched_players", [])
+        players = []
+        seen_player_refs = set()
+        for group_name in ("players", "watched_players"):
+            for player in completion.get(group_name, []) or []:
+                ref = id(player)
+                if ref in seen_player_refs:
+                    continue
+                seen_player_refs.add(ref)
+                players.append(player)
+
         if not players:
             return
 
         profile_cache = {}
         for player in players:
-            if (player.get("class_name") or "").casefold() != "guardian":
-                continue
-
             membership_id = str(player.get("membership_id") or "").strip()
             membership_type = self._safe_int(player.get("membership_type"))
             character_id = str(player.get("character_id") or "").strip()
@@ -619,17 +731,17 @@ class TeamDungeonTracker:
                         seen_instances.add(instance_id)
 
                         activity_hash = details.get("referenceId")
-                        if mode != 82:
-                            activity_hash_int = self._safe_int(activity_hash)
-                            activity_name = activity_name_cache.get(activity_hash_int)
-                            if activity_name is None and activity_hash_int is not None:
-                                try:
-                                    definition = await bungie_api.get_activity_definition(activity_hash_int)
-                                    activity_name = (definition.get("displayProperties") or {}).get("name")
-                                except Exception:
-                                    activity_name = ""
-                                activity_name_cache[activity_hash_int] = activity_name or ""
+                        activity_hash_int = self._safe_int(activity_hash)
+                        activity_name = activity_name_cache.get(activity_hash_int)
+                        if activity_name is None and activity_hash_int is not None:
+                            try:
+                                definition = await bungie_api.get_activity_definition(activity_hash_int)
+                                activity_name = (definition.get("displayProperties") or {}).get("name")
+                            except Exception:
+                                activity_name = ""
+                            activity_name_cache[activity_hash_int] = activity_name or ""
 
+                        if mode != 82:
                             if not self._activity_name_matches_presage(activity_name):
                                 continue
 
@@ -642,6 +754,8 @@ class TeamDungeonTracker:
                             continue
 
                         completion["instance_id"] = instance_id
+                        if activity_name:
+                            completion["resolved_activity_name"] = str(activity_name)
                         if completion.get("activity_hash") is None:
                             completion["activity_hash"] = details.get("referenceId")
                         if completion.get("period") is None:
@@ -667,7 +781,7 @@ class TeamDungeonTracker:
 
         lines.append("")
 
-        display_players = completion.get("players") or completion.get("watched_players", [])
+        display_players = (completion.get("players") or completion.get("watched_players", []))[:3]
         for index, player in enumerate(display_players):
             player_name = player.get("name") or "Player"
             class_emoji = player.get("class_emoji") or ":guardian:"
@@ -702,11 +816,16 @@ class TeamDungeonTracker:
             description_lines.append(f"<t:{int(completed_dt.timestamp())}:R>")
 
         embed = discord.Embed(
-            description="\n".join(description_lines),
+            description="\n".join(description_lines).strip(),
             color=discord.Color.gold(),
         )
 
         display_players = completion.get("players") or completion.get("watched_players", [])
+        display_players = sorted(
+            display_players,
+            key=lambda player: self._safe_int(player.get("kills")) or 0,
+            reverse=True,
+        )
         for player in display_players[:3]:
             player_name = self._compact_player_name(player.get("name"))
             class_icon = self._resolve_class_icon(player, guild_config)
@@ -717,14 +836,13 @@ class TeamDungeonTracker:
             assists = self._safe_int(player.get("assists")) or 0
             kd_text = self._kd_text(kills, deaths)
 
-            field_value = "\n".join(
-                [
-                    f"{class_icon} :power:{power_text}",
-                    f"K: {kills} | D: {deaths} | A: {assists}",
-                    f"K/D: {kd_text}",
-                ]
+            embed.add_field(
+                name=f"{player_name} {class_icon} :power:{power_text}",
+                value=f"K: {kills} | D: {deaths} | A: {assists} | K/D: {kd_text}",
+                inline=True,
             )
-            embed.add_field(name=player_name, value=field_value, inline=True)
+
+        embed.set_footer(text="via Wheelie Bin")
 
         return embed
 
@@ -768,6 +886,7 @@ class TeamDungeonTracker:
         seen_instance_ids,
         watched_membership_map,
         processed_instance_ids,
+        earliest_relevant_dt=None,
     ):
         completions = []
         bungie_api = self.get_bungie_api()
@@ -787,23 +906,36 @@ class TeamDungeonTracker:
 
         for character_id in character_ids:
             for mode in self.team_dungeon_activity_modes:
-                history = await bungie_api.get_activity_history(
-                    membership_type=membership_type,
-                    membership_id=membership_id,
-                    character_id=character_id,
-                    mode=mode,
-                    count=self.dungeon_history_count,
-                    page=0,
-                )
-                activities = history.get("activities", [])
-                for activity in activities:
-                    details = activity.get("activityDetails", {})
-                    instance_id = str(details.get("instanceId", ""))
-                    if not instance_id or instance_id in seen_instance_ids or instance_id in processed_instance_ids:
-                        continue
+                for page in range(self.history_max_pages):
+                    history = await bungie_api.get_activity_history(
+                        membership_type=membership_type,
+                        membership_id=membership_id,
+                        character_id=character_id,
+                        mode=mode,
+                        count=self.dungeon_history_count,
+                        page=page,
+                    )
+                    activities = history.get("activities", [])
+                    if not activities:
+                        break
+                    reached_old_activity = False
+                    for activity in activities:
+                        activity_period = self.parse_bungie_timestamp(activity.get("period"))
+                        if (
+                            earliest_relevant_dt is not None
+                            and activity_period is not None
+                            and activity_period < earliest_relevant_dt
+                        ):
+                            reached_old_activity = True
+                            break
 
-                    activity_hash = details.get("referenceId")
-                    if mode != 82:
+                        details = activity.get("activityDetails", {})
+                        instance_id = str(details.get("instanceId", ""))
+                        if not instance_id or instance_id in seen_instance_ids or instance_id in processed_instance_ids:
+                            continue
+                        processed_instance_ids.add(instance_id)
+
+                        activity_hash = details.get("referenceId")
                         activity_hash_int = self._safe_int(activity_hash)
                         activity_name = activity_name_cache.get(activity_hash_int)
                         if activity_name is None and activity_hash_int is not None:
@@ -814,66 +946,70 @@ class TeamDungeonTracker:
                                 activity_name = ""
                             activity_name_cache[activity_hash_int] = activity_name or ""
 
-                        if not self._activity_name_matches_presage(activity_name):
+                        if mode != 82:
+                            if not self._activity_name_matches_presage(activity_name):
+                                continue
+
+                        values = activity.get("values", {})
+                        completed = values.get("completed", {}).get("basic", {}).get("value", 0) == 1
+                        if not completed:
                             continue
 
-                    values = activity.get("values", {})
-                    completed = values.get("completed", {}).get("basic", {}).get("value", 0) == 1
-                    if not completed:
-                        continue
+                        pgcr = await bungie_api.get_pgcr(instance_id)
+                        entries = pgcr.get("entries", [])
+                        was_started_from_beginning = pgcr.get("activityWasStartedFromBeginning", True)
+                        player_membership_id = str(membership_id)
 
-                    pgcr = await bungie_api.get_pgcr(instance_id)
-                    entries = pgcr.get("entries", [])
-                    was_started_from_beginning = pgcr.get("activityWasStartedFromBeginning", True)
-                    player_membership_id = str(membership_id)
-
-                    completed_entries = [entry for entry in entries if self._entry_completed(entry)]
-                    completed_membership_ids = {
-                        str(
-                            (entry.get("player", {})
+                        completed_entries = [entry for entry in entries if self._entry_completed(entry)]
+                        completed_membership_ids = {
+                            str(
+                                (entry.get("player", {})
+                                .get("destinyUserInfo", {})
+                                .get("membershipId", ""))
+                            ).strip()
+                            for entry in completed_entries
+                            if entry.get("player", {})
                             .get("destinyUserInfo", {})
-                            .get("membershipId", ""))
-                        ).strip()
-                        for entry in completed_entries
-                        if entry.get("player", {})
-                        .get("destinyUserInfo", {})
-                        .get("membershipId")
-                    }
+                            .get("membershipId")
+                        }
 
-                    participant_membership_ids = {
-                        str(
-                            (entry.get("player", {})
+                        participant_membership_ids = {
+                            str(
+                                (entry.get("player", {})
+                                .get("destinyUserInfo", {})
+                                .get("membershipId", ""))
+                            ).strip()
+                            for entry in entries
+                            if entry.get("player", {})
                             .get("destinyUserInfo", {})
-                            .get("membershipId", ""))
-                        ).strip()
-                        for entry in entries
-                        if entry.get("player", {})
-                        .get("destinyUserInfo", {})
-                        .get("membershipId")
-                    }
+                            .get("membershipId")
+                        }
 
-                    if participant_membership_ids:
-                        is_solo = participant_membership_ids == {player_membership_id}
-                    else:
-                        is_solo = len(entries) == 1 or completed_membership_ids == {player_membership_id}
-                    if is_solo:
-                        continue
+                        if participant_membership_ids:
+                            is_solo = participant_membership_ids == {player_membership_id}
+                        else:
+                            is_solo = len(entries) == 1 or completed_membership_ids == {player_membership_id}
+                        if is_solo:
+                            continue
 
-                    completion = self._build_completion_from_pgcr(
-                        pgcr=pgcr,
-                        activity_hash=details.get("referenceId"),
-                        period=activity.get("period"),
-                        watched_membership_map=watched_membership_map,
-                        min_completions=self.min_completions,
-                    )
-                    if completion is None:
-                        continue
-                    await self._enrich_players_with_profile_class(completion)
+                        completion = self._build_completion_from_pgcr(
+                            pgcr=pgcr,
+                            activity_hash=details.get("referenceId"),
+                            period=activity.get("period"),
+                            watched_membership_map=watched_membership_map,
+                            min_completions=self.min_completions,
+                        )
+                        if completion is None:
+                            continue
+                        await self._enrich_players_with_profile_class(completion)
 
-                    # Keep the instance id from activity history for consistency.
-                    completion["instance_id"] = instance_id
-                    completions.append(completion)
-                    processed_instance_ids.add(instance_id)
+                        # Keep the instance id from activity history for consistency.
+                        completion["instance_id"] = instance_id
+                        if activity_name:
+                            completion["resolved_activity_name"] = str(activity_name)
+                        completions.append(completion)
+                    if reached_old_activity:
+                        break
 
         completions.sort(key=lambda item: item.get("period", ""))
         return completions
@@ -891,6 +1027,10 @@ class TeamDungeonTracker:
 
         guild_config = self.get_guild_config(guild.id)
         dungeon_name = await self.resolve_activity_name(completion.get("activity_hash"), guild_config=guild_config)
+        if str(dungeon_name or "").startswith("Dungeon ("):
+            resolved_activity_name = str(completion.get("resolved_activity_name") or "").strip()
+            if resolved_activity_name:
+                dungeon_name = resolved_activity_name
         completion["difficulty"] = await self.resolve_dungeon_difficulty_label(
             completion.get("activity_hash"),
             dungeon_name,
@@ -929,19 +1069,27 @@ class TeamDungeonTracker:
         team_mark_seen_ids = set()
         team_processed_instance_ids = set()
         team_recent_historic_candidates = []
+        fetch_semaphore = asyncio.Semaphore(self.player_fetch_concurrency)
 
-        for player in watched:
+        async def fetch_player_completions(player: dict):
             player_name = player.get("global_name", "Guardian")
-            try:
-                completions = await self.detect_new_team_dungeon_completions(
-                    player,
-                    team_seen_instance_ids,
-                    watched_membership_map,
-                    team_processed_instance_ids,
-                )
-            except Exception as e:
-                print(f"Team dungeon check failed for {player_name} in guild {guild.id}: {e}")
-                continue
+            async with fetch_semaphore:
+                try:
+                    completions = await self.detect_new_team_dungeon_completions(
+                        player,
+                        team_seen_instance_ids,
+                        watched_membership_map,
+                        team_processed_instance_ids,
+                        earliest_relevant_dt=threshold_dt,
+                    )
+                    return player, completions
+                except Exception as e:
+                    print(f"Team dungeon check failed for {player_name} in guild {guild.id}: {e}")
+                    return player, []
+
+        player_completion_results = await asyncio.gather(*(fetch_player_completions(player) for player in watched))
+
+        for player, completions in player_completion_results:
 
             for completion in completions:
                 instance_id = completion.get("instance_id")
@@ -969,13 +1117,19 @@ class TeamDungeonTracker:
 
                 if completion_dt <= team_last_checked_dt:
                     if completion_dt >= threshold_dt:
+                        reserved_for_post = False
+                        if instance_id not in posted_instance_ids:
+                            posted_instance_ids.add(instance_id)
+                            new_posted_instance_ids.append(instance_id)
+                            reserved_for_post = True
                         try:
                             await self.post_team_completion(guild, channel_id, completion)
                             team_mark_seen_ids.add(instance_id)
-                            if instance_id not in posted_instance_ids:
-                                posted_instance_ids.add(instance_id)
-                                new_posted_instance_ids.append(instance_id)
                         except Exception as e:
+                            if reserved_for_post:
+                                posted_instance_ids.discard(instance_id)
+                                if instance_id in new_posted_instance_ids:
+                                    new_posted_instance_ids.remove(instance_id)
                             print(
                                 f"Failed to post recent historic team completion (instance {instance_id}) "
                                 f"in guild {guild.id}: {e}"
@@ -985,12 +1139,18 @@ class TeamDungeonTracker:
                     continue
 
                 try:
-                    await self.post_team_completion(guild, channel_id, completion)
-                    team_mark_seen_ids.add(instance_id)
+                    reserved_for_post = False
                     if instance_id not in posted_instance_ids:
                         posted_instance_ids.add(instance_id)
                         new_posted_instance_ids.append(instance_id)
+                        reserved_for_post = True
+                    await self.post_team_completion(guild, channel_id, completion)
+                    team_mark_seen_ids.add(instance_id)
                 except Exception as e:
+                    if reserved_for_post:
+                        posted_instance_ids.discard(instance_id)
+                        if instance_id in new_posted_instance_ids:
+                            new_posted_instance_ids.remove(instance_id)
                     print(
                         f"Failed to post team completion (instance {instance_id}) "
                         f"in guild {guild.id}: {e}"
@@ -1013,13 +1173,19 @@ class TeamDungeonTracker:
                 if candidate_dt > post_not_before_dt:
                     continue
                 try:
-                    await self.post_team_completion(guild, channel_id, candidate_completion)
-                    historic_processed_ids.add(candidate_instance_id)
-                    team_mark_seen_ids.add(candidate_instance_id)
+                    reserved_for_post = False
                     if candidate_instance_id not in posted_instance_ids:
                         posted_instance_ids.add(candidate_instance_id)
                         new_posted_instance_ids.append(candidate_instance_id)
+                        reserved_for_post = True
+                    await self.post_team_completion(guild, channel_id, candidate_completion)
+                    historic_processed_ids.add(candidate_instance_id)
+                    team_mark_seen_ids.add(candidate_instance_id)
                 except Exception as e:
+                    if reserved_for_post:
+                        posted_instance_ids.discard(candidate_instance_id)
+                        if candidate_instance_id in new_posted_instance_ids:
+                            new_posted_instance_ids.remove(candidate_instance_id)
                     print(
                         f"Failed to post historic team completion (instance {candidate_instance_id}) "
                         f"in guild {guild.id}: {e}"
