@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 import aiohttp
 import discord
 from discord.ext import commands
-from discord.ext import tasks
+from discord.ext import tasks  # type: ignore[reportMissingImports]
 from discord import app_commands
 from dotenv import load_dotenv
 from discord import ui, Interaction
@@ -71,6 +71,7 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "Wheelie Bin").strip()
 startup_solo_scan_done = False
 startup_solo_scan_task = None
 extensions_loaded = False
+pantheon_modifier_name_cache = {}
 
 
 async def load_extensions():
@@ -290,6 +291,11 @@ SOLO_DUNGEON_TEXT_LINES = {
         "Deathless run. Controller still in one piece.",
         "No wipes, no panic, just violence.",
         "Flawless execution. The dungeon had no chance.",
+        "Perfect run. No mistakes, no deaths.",
+        "Flawless and untouchable. Dungeon conquered without a scratch.",
+        "Dungeon cleared without a single death.",
+        "Totally kicked ass, bosses beware.",
+        "Guardian prevailed, boss went home in a matchbox!",
     ],
     "dungeon_non_flawless": [
         "A little scuffed, a lot legendary.",
@@ -297,6 +303,11 @@ SOLO_DUNGEON_TEXT_LINES = {
         "Stayed with it and got the solo done.",
         "A few setbacks, still a great solo clear.",
         "Scuffed? Sure. Cleared? Absolutely.",
+        "Not perfect, but still victorious.",
+        "A few mistakes, but the dungeon fell.",
+        "Imperfections aside, the solo was a success.",
+        "The dungeon was tough, but the solo prevailed.",
+        "Victory achieved, despite the bumps along the way.",
     ],
     "exotic_flawless": [
         "Deathless exotic run. Someone tell the Vanguard.",
@@ -304,14 +315,25 @@ SOLO_DUNGEON_TEXT_LINES = {
         "Zero deaths, maximum flex.",
         "Clean exotic mission. Bosses taking emotional damage.",
         "Boss deleted. Guardian unscuffed.",
+        "Exotic mission flawless. No casualties.",
+        "Exotic mission completed without a single death.",
+        "No mistakes, no deaths. Exotic mission mastered.",
+        "Exotic mission conquered without a scratch.",
+        "Exotic mission completed, boss got totally wedgied.",
+
+
     ],
     "exotic_non_flawless": [
-        "Scuffed the route, still got the clear.",
+        "Scuffed a little, still got the clear.",
         "Not flawless, still cinematic.",
         "A little chaos, mission still complete.",
         "Respawns happened. Victory happened too.",
         "A little chaos, a lot of damage.",
         "A hard-fought solo clear. Great resilience.",
+        "Mission completed despite the chaos.",
+        "Despite the setbacks, the mission was a success.",
+        "Chaos managed, mission accomplished.",
+        "Mission survived the chaos, victory intact.",
     ],
 }
 
@@ -748,25 +770,63 @@ def resolve_dungeon_image_by_name(dungeon_name: str, guild_config):
         text = re.sub(r"[^a-z0-9]+", "", text)
         return text
 
+    def _pantheon_lookup_candidates(value: str):
+        lowered = str(value or "").casefold().strip()
+        if "pantheon" not in lowered:
+            return []
+
+        candidates = ["The Pantheon", "Pantheon"]
+        calus_resplendent_tokens = {
+            "calus resplendent",
+            "argos",
+            "gahlran",
+            "emperor calus",
+        }
+        morgeth_surpassing_tokens = {
+            "morgeth surpassing",
+            "warpriest",
+            "consecrated mind",
+            "morgeth",
+        }
+        insurrection_revolutionary_tokens = {
+            "insurrection prime revolutionary",
+            "insurrection prime",
+        }
+
+        if any(token in lowered for token in calus_resplendent_tokens):
+            candidates.append("Calus Resplendent")
+        if any(token in lowered for token in morgeth_surpassing_tokens):
+            candidates.append("Morgeth Surpassing")
+        if any(token in lowered for token in insurrection_revolutionary_tokens):
+            candidates.append("Insurrection Prime Revolutionary")
+
+        return candidates
+
     config = guild_config or {}
     # Check each map in priority order; do not stop at the first non-empty map.
     custom_maps = [
         config.get("solo_dungeon_image_by_name") or {},
+        config.get("team_raid_thumbnail_by_name") or {},
+        config.get("raid_thumbnail_by_name") or {},
         config.get("team_dungeon_thumbnail_by_name") or {},
         config.get("dungeon_thumbnail_by_name") or {},
     ]
     normalized_target = str(dungeon_name).casefold().strip()
     normalized_target_compact = _normalize_lookup_key(dungeon_name)
+    lookup_names = [dungeon_name, *_pantheon_lookup_candidates(dungeon_name)]
     if normalized_target:
         for custom_map in custom_maps:
-            for key, value in custom_map.items():
-                if not key or not value:
-                    continue
-                normalized_key = str(key).casefold().strip()
-                if normalized_key == normalized_target:
-                    return str(value)
-                if normalized_target_compact and _normalize_lookup_key(normalized_key) == normalized_target_compact:
-                    return str(value)
+            for lookup_name in lookup_names:
+                lookup_compact = _normalize_lookup_key(lookup_name)
+                lookup_text = str(lookup_name).casefold().strip()
+                for key, value in custom_map.items():
+                    if not key or not value:
+                        continue
+                    normalized_key = str(key).casefold().strip()
+                    if normalized_key == lookup_text:
+                        return str(value)
+                    if lookup_compact and _normalize_lookup_key(normalized_key) == lookup_compact:
+                        return str(value)
 
     # Fallback: some activity names include extra prefixes/qualifiers
     # (e.g. "Grandmaster Conquest - Heliostat"), so match compact keys by containment.
@@ -1418,6 +1478,8 @@ async def detect_new_solo_dungeon_completions(player, seen_instance_ids, min_per
                     except (TypeError, ValueError):
                         duration_seconds = None
 
+                    feat_names = await resolve_feat_names_from_pgcr(pgcr)
+
                     is_flawless = False
                     try:
                         is_flawless = int(deaths_value) == 0
@@ -1437,6 +1499,7 @@ async def detect_new_solo_dungeon_completions(player, seen_instance_ids, min_per
                             "opponents_defeated": opponents_defeated_value,
                             "assists": assists_value,
                             "duration_seconds": duration_seconds,
+                            "feat_names": feat_names,
                             "class_name": class_name,
                             "subclass_name": subclass_name,
                             "was_started_from_beginning": was_started_from_beginning,
@@ -1584,6 +1647,52 @@ def get_solo_watch_scope(guild_config):
     if configured in {"server", "clan", "manual"}:
         return configured
     return "clan" if BUNGIE_CLAN_ID else "manual"
+
+
+def is_pantheon_activity_name(activity_name: str | None):
+    lowered = str(activity_name or "").casefold().strip()
+    if not lowered:
+        return False
+    pantheon_tokens = {
+        "pantheon",
+        "calus resplendent",
+        "morgeth surpassing",
+        "insurrection prime revolutionary",
+        "insurrection prime",
+    }
+    return any(token in lowered for token in pantheon_tokens)
+
+
+async def resolve_feat_names_from_pgcr(pgcr):
+    selected_hashes = list((pgcr or {}).get("selectedSkullHashes") or [])
+    if not selected_hashes or bungie_api is None:
+        return []
+
+    feat_names = []
+    seen = set()
+    for raw_hash in selected_hashes:
+        try:
+            modifier_hash = int(raw_hash)
+        except (TypeError, ValueError):
+            continue
+
+        if modifier_hash in pantheon_modifier_name_cache:
+            resolved_name = pantheon_modifier_name_cache[modifier_hash]
+        else:
+            try:
+                definition = await bungie_api.get_activity_modifier_definition(modifier_hash)
+            except Exception:
+                definition = {}
+            resolved_name = str((definition.get("displayProperties") or {}).get("name") or "").strip()
+            pantheon_modifier_name_cache[modifier_hash] = resolved_name
+
+        lowered = resolved_name.casefold()
+        if not lowered or lowered in seen:
+            continue
+        seen.add(lowered)
+        feat_names.append(resolved_name)
+
+    return feat_names
 
 
 def normalize_golden_oldies_solo_activity_name(guild_id: int | str | None, activity_name: str | None):
@@ -1858,6 +1967,7 @@ async def post_solo_completion(guild: discord.Guild, channel_id: str, player, co
     opponents_defeated_value = completion.get("opponents_defeated")
     deaths_value = completion.get("deaths")
     duration_text = format_duration(duration_seconds)
+    feat_names = [str(name).strip() for name in (completion.get("feat_names") or []) if str(name).strip()]
 
     kills_text = format_int_stat(kills_value) or "—"
     deaths_text = format_int_stat(deaths_value) or "—"
@@ -1865,6 +1975,8 @@ async def post_solo_completion(guild: discord.Guild, channel_id: str, player, co
     embed.add_field(name="Kills", value=kills_text, inline=True)
     embed.add_field(name="Deaths", value=deaths_text, inline=True)
     embed.add_field(name="Time", value=time_text, inline=True)
+    if is_pantheon_activity_name(dungeon_name) and feat_names:
+        embed.add_field(name="Feats", value=" | ".join(feat_names), inline=True)
 
     await channel.send(embed=embed)
     solo_debug(
@@ -2693,7 +2805,6 @@ async def on_raw_reaction_remove(payload):
 
 
 @bot.tree.command(name="test_welcome", description="Test the welcome embed in the current channel.")
-@app_commands.checks.has_permissions(administrator=True)
 async def test_welcome(interaction: discord.Interaction):
     member = interaction.user
     guild_config = rules_config.get(str(interaction.guild_id), {})
@@ -2744,7 +2855,6 @@ async def set_rules_channel(interaction: discord.Interaction, channel: discord.T
 
 
 @bot.tree.command(name="set_rules_role", description="Set the role to grant when members agree to the rules.")
-@app_commands.checks.has_permissions(administrator=True)
 @app_commands.describe(role="Role to grant after a member reacts to the rules message")
 async def set_rules_role(interaction: discord.Interaction, role: discord.Role):
     guild_id = str(interaction.guild_id)
@@ -2790,7 +2900,6 @@ async def unset_welcome_channel(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="set_welcome_logo", description="Set or clear the welcome embed bottom logo image.")
-@app_commands.checks.has_permissions(administrator=True)
 @app_commands.describe(url="Direct image URL (leave blank to clear, or use clear/off/unset)")
 async def set_welcome_logo(interaction: discord.Interaction, url: str | None = None):
     guild_id = str(interaction.guild_id)
@@ -3105,7 +3214,6 @@ async def unset_raid_weapon_channel(interaction: discord.Interaction):
 @bot.tree.command(
     name="set_dungeon_full_clear_seconds",
     description="Set the minimum runtime (seconds) treated as a full clear; lower is treated as checkpoint clear.")
-@app_commands.checks.has_permissions(administrator=True)
 @app_commands.describe(seconds="Minimum duration in seconds for a full clear (example: 900)")
 async def set_dungeon_full_clear_seconds(interaction: discord.Interaction, seconds: app_commands.Range[int, 60, 21600]):
     if interaction.guild_id is None:
@@ -3126,7 +3234,6 @@ async def set_dungeon_full_clear_seconds(interaction: discord.Interaction, secon
     name="set_solo_watch_scope",
     description="Set whether solo/team tracking watches clan roster or only members in this server.",
 )
-@app_commands.checks.has_permissions(administrator=True)
 @app_commands.describe(scope="Choose clan (all clan roster) or server (only Discord members in this server)")
 @app_commands.choices(
     scope=[
@@ -3249,7 +3356,6 @@ async def post_latest_solo_embed(
 
 
 @bot.tree.command(name="test_dungeon_embed", description="Post a real solo dungeon embed from a Bungie gamertag.")
-@app_commands.checks.has_permissions(administrator=True)
 @app_commands.describe(
     gamertag="Bungie name like WH33LS or WH33LS#8650",
     channel="Optional channel for the test post (defaults to this channel)",
@@ -3268,7 +3374,6 @@ async def test_dungeon_embed(
 
 
 @bot.tree.command(name="post_latest_solo", description="Post your latest real solo dungeon embed like a normal announcement.")
-@app_commands.checks.has_permissions(administrator=True)
 @app_commands.describe(
     gamertag="Bungie name like WH33LS or WH33LS#8650",
     channel="Optional channel for the post (defaults to this channel)",
@@ -3287,7 +3392,6 @@ async def post_latest_solo(
 
 
 @bot.tree.command(name="test_raid_embed", description="Post a test raid embed preview with your configured raid image.")
-@app_commands.checks.has_permissions(administrator=True)
 @app_commands.describe(
     raid_name="Raid name to preview (must match your raid image mapping name)",
 )
@@ -3321,7 +3425,6 @@ async def test_raid_embed(
     name="test_team_dungeon_post",
     description="Post a real team dungeon completion message from a Bungie gamertag.",
 )
-@app_commands.checks.has_permissions(administrator=True)
 @app_commands.describe(
     gamertag="Bungie name like WH33LS or WH33LS#8650",
     channel="Optional channel for the test post (defaults to this channel)",
@@ -3412,7 +3515,6 @@ async def test_team_dungeon_post(
     name="backfill_team_dungeons",
     description="Backfill missed team dungeon posts from the last X minutes.",
 )
-@app_commands.checks.has_permissions(administrator=True)
 @app_commands.describe(
     minutes="How far back to scan for missed completions (default: 180)",
     channel="Optional channel for backfill posts (defaults to configured team dungeon channel)",
@@ -3559,7 +3661,6 @@ async def backfill_team_dungeons(
     name="test_team_raid_post",
     description="Post a real team raid completion message from a Bungie gamertag.",
 )
-@app_commands.checks.has_permissions(administrator=True)
 @app_commands.describe(
     gamertag="Bungie name like WH33LS or WH33LS#8650",
     channel="Optional channel for the test post (defaults to this channel)",
@@ -3657,7 +3758,6 @@ async def test_team_raid_post(
     name="raid_weapons",
     description="Show raid weapons and where they drop by encounter.",
 )
-@app_commands.checks.has_permissions(administrator=True)
 @app_commands.describe(
     raid="Raid to show weapon drops for",
     channel="Optional channel to post in (defaults to this channel)",
@@ -3713,17 +3813,14 @@ async def raid_weapons(
         )
         return
 
+    await interaction.response.defer(ephemeral=True)
     await target_channel.send(embed=embed)
-    await interaction.response.send_message(
-        f"Posted raid weapons for **{raid.name}** to {target_channel.mention}.",
-        ephemeral=True,
-    )
+    await interaction.delete_original_response()
 
 
 @bot.tree.command(
     name="post_dungeon_embed",
     description="Post a dungeon embed to the configured dungeon channel without leaving a public command response.")
-@app_commands.checks.has_permissions(administrator=True)
 @app_commands.describe(
     player_name="Name to show in the embed (defaults to your Discord display name)",
     dungeon_name="Dungeon name to show in the embed",

@@ -6,6 +6,7 @@ import discord
 RAID_WEAPON_TABLE = {
     "deep_stone_crypt": {
         "display_name": "Deep Stone Crypt",
+        "exotic_image_url": "https://i.postimg.cc/QM0c3GwK/Eyes-of-Tomorrow.jpg",
         "thumbnail_url": "https://www.bungie.net/common/destiny2_content/icons/4cf7f7f8fb1ff84709fddf4b2f6fcf34.jpg",
         "encounters": [
             {
@@ -28,6 +29,7 @@ RAID_WEAPON_TABLE = {
     },
     "root_of_nightmares": {
         "display_name": "Root of Nightmares",
+        "exotic_image_url": "https://i.postimg.cc/MpgYLSkY/Conditional-Finality.jpg",
         "encounters": [
             {
                 "name": "Cataclysm",
@@ -70,6 +72,7 @@ RAID_WEAPON_TABLE = {
     },
     "crotas_end": {
         "display_name": "Crota's End",
+        "exotic_image_url": "https://i.postimg.cc/yxKQbzZn/Necrochasm1-500x500.webp",
         "encounters": [
             {
                 "name": "The Abyss",
@@ -108,6 +111,7 @@ RAID_WEAPON_TABLE = {
     },
     "vault_of_glass": {
         "display_name": "Vault of Glass",
+        "exotic_image_url": "https://i.postimg.cc/XNxkbFMh/vex-mythoclast-list-webp.webp",
         "encounters": [
             {
                 "name": "Confluxes",
@@ -154,6 +158,7 @@ RAID_WEAPON_TABLE = {
     },
     "salvations_edge": {
         "display_name": "Salvation's Edge",
+        "exotic_image_url": "https://i.postimg.cc/hj1bhQXj/Euphony.avif",
         "encounters": [
             {
                 "name": "Substratum",
@@ -200,52 +205,47 @@ RAID_WEAPON_TABLE = {
     },
     "desert_perpetual": {
         "display_name": "Desert Perpetual",
+        "exotic_image_url": "https://i.postimg.cc/yx6hR694/Whirling-Ovation.webp",
+        "horizontal_weapon_list": False,
         "encounters": [
             {
-                "name": "Substratum",
+                "name": "Agraios, Inherent (Hobgoblin)",
                 "weapons": [
-                    "Imminence (Submachine Gun)",
-                    "Non-Denouement (Combat Bow)",
-                    "Nullify (Pulse Rifle)",
+                    "Antedate (Submachine Gun)",
+                    "Lance Ephemeral (Sniper Rifle)",
+                    "Intercalary (Auto Rifle)",
                 ],
             },
             {
-                "name": "Herald of Finality",
+                "name": "Iatros, Inward-Turned (Wyvern)",
                 "weapons": [
-                    "Imminence (Submachine Gun)",
-                    "Forthcoming Deviance (Glaive)",
-                    "Non-Denouement (Combat Bow)",
+                    "Finite Maybe (Fusion Rifle)",
+                    "The When and Where (Rocket Launcher)",
                 ],
             },
             {
-                "name": "Repository",
+                "name": "Epoptes, Lord of Quanta (Hydra)",
                 "weapons": [
-                    "Critical Anomaly (Sniper Rifle)",
-                    "Forthcoming Deviance (Glaive)",
-                    "Nullify (Pulse Rifle)",
+                    "Opaque Hourglass (Combat Bow)",
                 ],
             },
             {
-                "name": "Verity",
+                "name": "Koregos, the Worldline (Final Boss)",
                 "weapons": [
-                    "Imminence (Submachine Gun)",
-                    "Summum Bonum (Sword)",
-                    "Non-Denouement (Combat Bow)",
-                ],
-            },
-            {
-                "name": "The Witness",
-                "weapons": [
-                    "Critical Anomaly (Sniper Rifle)",
-                    "Summum Bonum (Sword)",
-                    "Nullify (Pulse Rifle)",
-                    "Euphony (Exotic Linear Fusion Rifle)",
+                    "Antedate (Submachine Gun)",
+                    "Lance Ephemeral (Sniper Rifle)",
+                    "Intercalary (Auto Rifle)",
+                    "Finite Maybe (Fusion Rifle)",
+                    "The When and Where (Rocket Launcher)",
+                    "Opaque Hourglass (Combat Bow)",
+                    "Whirling Ovation (Exotic Rocket Launcher)",
                 ],
             },
         ],
     },
     "vow_of_the_disciple": {
         "display_name": "Vow of the Disciple",
+        "exotic_image_url": "https://i.postimg.cc/6Qsd0fR3/collective-obligation.webp",
         "encounters": [
             {
                 "name": "Acquisition",
@@ -284,6 +284,7 @@ RAID_WEAPON_TABLE = {
     },
     "last_wish": {
         "display_name": "Last Wish",
+        "exotic_image_url": "https://i.postimg.cc/yYYngjXg/One-Thousand-Voices.jpg",
         "encounters": [
             {
                 "name": "Shared Raid Pool",
@@ -303,6 +304,8 @@ RAID_WEAPON_TABLE = {
     },
     "kings_fall": {
         "display_name": "King's Fall",
+        "exotic_image_url": "https://i.postimg.cc/1RKJ32Fv/Touch-of-Malice.jpg",
+        "horizontal_weapon_list": True,
         "encounters": [
             {
                 "name": "Gate",
@@ -359,6 +362,7 @@ RAID_WEAPON_TABLE = {
     },
     "garden_of_salvation": {
         "display_name": "Garden of Salvation",
+        "exotic_image_url": "https://i.postimg.cc/D076cd9M/DIVINITY.jpg",
         "encounters": [
             {
                 "name": "Evade the Consecrated Mind",
@@ -418,14 +422,22 @@ def build_raid_weapons_embed(raid_key: str):
         color=discord.Color.gold(),
     )
 
-    thumbnail_url = raid_data.get("thumbnail_url")
-    if thumbnail_url:
-        embed.set_thumbnail(url=thumbnail_url)
+    exotic_image_url = raid_data.get("exotic_image_url")
+    if exotic_image_url:
+        embed.set_image(url=exotic_image_url)
+
+    use_horizontal_weapon_list = raid_data.get("horizontal_weapon_list", True)
 
     for encounter in raid_data.get("encounters", []):
         encounter_name = encounter.get("name") or "Encounter"
         weapons = encounter.get("weapons") or []
-        weapon_lines = "\n".join(f"• {weapon}" for weapon in weapons) if weapons else "• No weapon data yet"
+        if weapons:
+            if use_horizontal_weapon_list:
+                weapon_lines = " • ".join(weapons)
+            else:
+                weapon_lines = "\n".join(f"• {weapon}" for weapon in weapons)
+        else:
+            weapon_lines = "• No weapon data yet"
         embed.add_field(name=encounter_name, value=weapon_lines, inline=False)
 
     embed.set_footer(text="via Wheelie Bin")

@@ -137,8 +137,17 @@ EXOTIC_MISSION_NAME_KEYWORDS = (
 )
 
 
+def _is_pantheon_raid_label(name: str | None) -> bool:
+    if not name:
+        return False
+    normalized = re.sub(r"[^a-z0-9]+", " ", str(name).casefold()).strip()
+    return "pantheon" in normalized
+
+
 def activity_name_matches_special_solo_activity(name: str | None):
     if not name:
+        return False
+    if _is_pantheon_raid_label(name):
         return False
     normalized = str(name).casefold().strip()
     normalized_compact = re.sub(r"[^a-z0-9]+", " ", normalized).strip()
@@ -162,6 +171,8 @@ def normalize_special_solo_activity_display_name(name: str | None):
 
     value = str(name).strip()
     if not value:
+        return value
+    if _is_pantheon_raid_label(value):
         return value
 
     # Normalize Bungie variant labels to a cleaner public naming scheme.

@@ -14,6 +14,7 @@ from pinnacle_ops import (
     activity_name_matches_special_solo_activity,
     normalize_special_solo_activity_display_name,
 )
+from raid_weapons_embed import build_raid_weapons_embed, get_raid_weapon_choices
 from .config import (
     BUNGIE_API_KEY,
     BUNGIE_CLAN_ID,
@@ -37,6 +38,7 @@ bot = commands.Bot(command_prefix="/", intents=intents)
 rules_config = load_config()
 bungie_api = None
 startup_solo_scan_done = False
+pantheon_modifier_name_cache = {}
 
 
 def sanitize_thumbnail_url(raw_url) -> str | None:
@@ -355,6 +357,52 @@ def should_hide_status_for_short_exotic_run(activity_name: str | None, duration_
     return name_text.startswith("exotic mission -")
 
 
+def is_pantheon_activity_name(activity_name: str | None):
+    lowered = str(activity_name or "").casefold().strip()
+    if not lowered:
+        return False
+    pantheon_tokens = {
+        "pantheon",
+        "calus resplendent",
+        "morgeth surpassing",
+        "insurrection prime revolutionary",
+        "insurrection prime",
+    }
+    return any(token in lowered for token in pantheon_tokens)
+
+
+async def resolve_feat_names_from_pgcr(pgcr):
+    selected_hashes = list((pgcr or {}).get("selectedSkullHashes") or [])
+    if not selected_hashes or bungie_api is None:
+        return []
+
+    feat_names = []
+    seen = set()
+    for raw_hash in selected_hashes:
+        try:
+            modifier_hash = int(raw_hash)
+        except (TypeError, ValueError):
+            continue
+
+        if modifier_hash in pantheon_modifier_name_cache:
+            resolved_name = pantheon_modifier_name_cache[modifier_hash]
+        else:
+            try:
+                definition = await bungie_api.get_activity_modifier_definition(modifier_hash)
+            except Exception:
+                definition = {}
+            resolved_name = str((definition.get("displayProperties") or {}).get("name") or "").strip()
+            pantheon_modifier_name_cache[modifier_hash] = resolved_name
+
+        lowered = resolved_name.casefold()
+        if not lowered or lowered in seen:
+            continue
+        seen.add(lowered)
+        feat_names.append(resolved_name)
+
+    return feat_names
+
+
 def parse_bungie_profile_input(value: str):
     if not value:
         return None
@@ -667,6 +715,7 @@ async def detect_new_solo_dungeon_completions(player, seen_instance_ids):
                             "deaths": deaths_value,
                             "kills": kills_value,
                             "duration_seconds": duration_seconds,
+                            "feat_names": await resolve_feat_names_from_pgcr(pgcr),
                             "was_started_from_beginning": pgcr.get("activityWasStartedFromBeginning", True),
                         }
                     )
@@ -710,6 +759,9 @@ async def post_solo_completion(guild: discord.Guild, channel_id: str, player, co
     hide_status = should_hide_status_for_short_exotic_run(dungeon_name, completion.get("duration_seconds"))
     if not hide_status:
         embed.add_field(name="Status", value=status, inline=True)
+    feat_names = [str(name).strip() for name in (completion.get("feat_names") or []) if str(name).strip()]
+    if is_pantheon_activity_name(dungeon_name) and feat_names:
+        embed.add_field(name="Feats", value=" | ".join(feat_names), inline=True)
 
     await channel.send(embed=embed)
 
@@ -999,6 +1051,140 @@ async def unset_dungeon_channel(interaction: discord.Interaction):
     rules_config[str(interaction.guild_id)] = guild_config
     save_config(rules_config)
     await interaction.response.send_message("Solo/flawless dungeon channel has been unset.", ephemeral=True)
+
+
+@bot.tree.command(
+    name="set_raid_weapon_channel",
+    description="Set the default channel for /raid_weapons posts.",
+)
+@app_commands.checks.has_permissions(manage_channels=True)
+@app_commands.describe(channel="Optional channel ID, #mention, or name. Leave empty to use this channel.")
+async def set_raid_weapon_channel(
+    interaction: discord.Interaction,
+    channel: str | None = None,
+):
+    if interaction.guild_id is None or interaction.guild is None:
+        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+        return
+
+    if not is_allowed_guild(interaction.guild_id):
+        await interaction.response.send_message("This bot is only enabled for Seal Team Six servers.", ephemeral=True)
+        return
+
+    target_channel = await resolve_text_channel_from_input(interaction.guild, channel)
+    if target_channel is None:
+        current_channel = interaction.channel
+        if isinstance(current_channel, discord.TextChannel) and (channel is None or not str(channel).strip()):
+            target_channel = current_channel
+
+    if target_channel is None or target_channel.guild.id != interaction.guild_id:
+        await interaction.response.send_message(
+            "Could not find that text channel. Use a channel ID, #mention, or channel name.",
+            ephemeral=True,
+        )
+        return
+
+    guild_config = get_guild_config(rules_config, interaction.guild_id)
+    guild_config["raid_weapon_channel_id"] = str(target_channel.id)
+    rules_config[str(interaction.guild_id)] = guild_config
+    save_config(rules_config)
+    await interaction.response.send_message(
+        f"Raid weapon channel set to {target_channel.mention}.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="unset_raid_weapon_channel",
+    description="Unset the default channel for /raid_weapons posts.",
+)
+@app_commands.checks.has_permissions(manage_channels=True)
+async def unset_raid_weapon_channel(interaction: discord.Interaction):
+    if interaction.guild_id is None:
+        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+        return
+
+    if not is_allowed_guild(interaction.guild_id):
+        await interaction.response.send_message("This bot is only enabled for Seal Team Six servers.", ephemeral=True)
+        return
+
+    guild_config = get_guild_config(rules_config, interaction.guild_id)
+    if "raid_weapon_channel_id" in guild_config:
+        guild_config.pop("raid_weapon_channel_id", None)
+        rules_config[str(interaction.guild_id)] = guild_config
+        save_config(rules_config)
+
+    await interaction.response.send_message("Raid weapon channel has been unset.", ephemeral=True)
+
+
+@bot.tree.command(
+    name="raid_weapons",
+    description="Show raid weapons and where they drop by encounter.",
+)
+@app_commands.describe(
+    raid="Raid to show weapon drops for",
+)
+@app_commands.choices(
+    raid=[
+        app_commands.Choice(name=choice_name, value=choice_value)
+        for choice_name, choice_value in get_raid_weapon_choices()
+    ]
+)
+async def raid_weapons(
+    interaction: discord.Interaction,
+    raid: app_commands.Choice[str],
+):
+    if interaction.guild_id is None:
+        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+        return
+
+    if not is_allowed_guild(interaction.guild_id):
+        await interaction.response.send_message("This bot is only enabled for Seal Team Six servers.", ephemeral=True)
+        return
+
+    target_channel = interaction.channel
+    if not isinstance(target_channel, discord.TextChannel):
+        await interaction.response.send_message(
+            "Please use this command in a text channel.",
+            ephemeral=True,
+        )
+        return
+
+    if target_channel.guild.id != interaction.guild_id:
+        await interaction.response.send_message(
+            "The selected channel must be in this server.",
+            ephemeral=True,
+        )
+        return
+
+    embed = build_raid_weapons_embed(raid.value)
+    if embed is None:
+        await interaction.response.send_message(
+            "No raid weapon table found for that raid yet.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        message = "You need **Manage Channels** permission to use that command."
+    elif isinstance(error, app_commands.CheckFailure):
+        message = "You don’t have permission to use that command."
+    else:
+        print(f"[STS_SOLO] App command error: {error}")
+        message = "Something went wrong while running that command. Please try again."
+
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except Exception as followup_error:
+        print(f"[STS_SOLO] Failed to send app command error response: {followup_error}")
 
 
 @bot.event

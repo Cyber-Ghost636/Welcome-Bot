@@ -50,6 +50,7 @@ class TeamRaidTracker:
         self.min_completions = max(3, int(min_completions))
         self.player_fetch_concurrency = max(1, int(os.getenv("TEAM_PLAYER_CONCURRENCY", "4")))
         self.activity_icon_cache = {}
+        self.modifier_name_cache = {}
         self.class_emoji_by_type = {
             0: ":titan:",
             1: ":hunter:",
@@ -205,6 +206,85 @@ class TeamRaidTracker:
         text = text.replace("insurrectiopn", "insurrection")
         return re.sub(r"[^a-z0-9]+", "", text)
 
+    def _is_pantheon_activity_name(self, value: str | None):
+        lowered = str(value or "").casefold().strip()
+        if not lowered:
+            return False
+        pantheon_tokens = {
+            "pantheon",
+            "calus resplendent",
+            "morgeth surpassing",
+            "insurrection prime revolutionary",
+            "insurrection prime",
+        }
+        return any(token in lowered for token in pantheon_tokens)
+
+    async def _resolve_feat_names_from_pgcr(self, pgcr):
+        selected_hashes = list((pgcr or {}).get("selectedSkullHashes") or [])
+        if not selected_hashes:
+            return []
+
+        bungie_api = self.get_bungie_api()
+        if bungie_api is None:
+            return []
+
+        feat_names = []
+        seen = set()
+        for raw_hash in selected_hashes:
+            modifier_hash = self._safe_int(raw_hash)
+            if modifier_hash is None:
+                continue
+
+            if modifier_hash in self.modifier_name_cache:
+                resolved_name = self.modifier_name_cache[modifier_hash]
+            else:
+                try:
+                    definition = await bungie_api.get_activity_modifier_definition(modifier_hash)
+                except Exception:
+                    definition = {}
+                resolved_name = str((definition.get("displayProperties") or {}).get("name") or "").strip()
+                self.modifier_name_cache[modifier_hash] = resolved_name
+
+            lowered = resolved_name.casefold()
+            if not lowered or lowered in seen:
+                continue
+            seen.add(lowered)
+            feat_names.append(resolved_name)
+
+        return feat_names
+
+    def _pantheon_thumbnail_candidates(self, value: str):
+        lowered = str(value or "").casefold().strip()
+        if "pantheon" not in lowered:
+            return []
+
+        candidates = ["The Pantheon", "Pantheon"]
+        calus_resplendent_tokens = {
+            "calus resplendent",
+            "argos",
+            "gahlran",
+            "emperor calus",
+        }
+        morgeth_surpassing_tokens = {
+            "morgeth surpassing",
+            "warpriest",
+            "consecrated mind",
+            "morgeth",
+        }
+        insurrection_revolutionary_tokens = {
+            "insurrection prime revolutionary",
+            "insurrection prime",
+        }
+
+        if any(token in lowered for token in calus_resplendent_tokens):
+            candidates.append("Calus Resplendent")
+        if any(token in lowered for token in morgeth_surpassing_tokens):
+            candidates.append("Morgeth Surpassing")
+        if any(token in lowered for token in insurrection_revolutionary_tokens):
+            candidates.append("Insurrection Prime Revolutionary")
+
+        return candidates
+
     async def resolve_raid_difficulty_label(self, activity_hash, raid_name: str | None = None):
         activity_hash_int = self._safe_int(activity_hash)
         if activity_hash_int is None:
@@ -268,8 +348,7 @@ class TeamRaidTracker:
     async def resolve_raid_thumbnail_url(self, raid_name: str, activity_hash, guild_config):
         guild_config = guild_config or {}
         normalized_name = self._normalize_raid_name(raid_name)
-        canonical_lookup = self._canonical_raid_key(normalized_name)
-        compact_lookup = self._thumbnail_lookup_key(normalized_name)
+        thumbnail_lookup_names = [normalized_name, *self._pantheon_thumbnail_candidates(normalized_name)]
 
         # Keep raid mappings prioritized for raid posts.
         custom_maps = [
@@ -309,9 +388,10 @@ class TeamRaidTracker:
             return None
 
         for custom_map in custom_maps:
-            matched = _find_thumbnail_in_map(custom_map, normalized_name)
-            if matched:
-                return matched
+            for lookup_name in thumbnail_lookup_names:
+                matched = _find_thumbnail_in_map(custom_map, lookup_name)
+                if matched:
+                    return matched
 
         # Auto-resolve thumbnail from Bungie activity definition.
         activity_hash_int = self._safe_int(activity_hash)
@@ -337,10 +417,12 @@ class TeamRaidTracker:
                     display = definition.get("displayProperties") or {}
                     display_name = display.get("name")
                     if display_name:
+                        display_lookup_names = [display_name, *self._pantheon_thumbnail_candidates(display_name)]
                         for custom_map in custom_maps:
-                            mapped_from_definition = _find_thumbnail_in_map(custom_map, display_name)
-                            if mapped_from_definition:
-                                return mapped_from_definition
+                            for lookup_name in display_lookup_names:
+                                mapped_from_definition = _find_thumbnail_in_map(custom_map, lookup_name)
+                                if mapped_from_definition:
+                                    return mapped_from_definition
 
                     icon_path = display.get("icon")
                     icon_url = self._normalize_bungie_image_url(icon_path)
@@ -706,6 +788,7 @@ class TeamRaidTracker:
             min_completions=self.min_completions if min_completions is None else min_completions,
             min_total_completions=self.min_total_completed_players,
         )
+        completion["feat_names"] = await self._resolve_feat_names_from_pgcr(pgcr)
         await self._enrich_players_with_profile_class(completion)
         return completion
 
@@ -794,6 +877,9 @@ class TeamRaidTracker:
         title_name = self._normalize_raid_name(raid_name)
         difficulty = completion.get("difficulty") or "Standard"
         lines = [f"{title_name} - {difficulty}"]
+        feat_names = [str(name).strip() for name in (completion.get("feat_names") or []) if str(name).strip()]
+        if self._is_pantheon_activity_name(title_name) and feat_names:
+            lines[0] = f"{lines[0]} | Feats: {' | '.join(feat_names)}"
 
         lines.append("")
 
@@ -826,8 +912,11 @@ class TeamRaidTracker:
         title_name = self._normalize_raid_name(raid_name)
         difficulty = completion.get("difficulty") or "Standard"
         completed_dt = self.parse_bungie_timestamp(completion.get("period"))
+        feat_names = [str(name).strip() for name in (completion.get("feat_names") or []) if str(name).strip()]
 
         description_lines = [f"**{title_name}: {difficulty} - {duration_text}**"]
+        if self._is_pantheon_activity_name(title_name) and feat_names:
+            description_lines.append(f"Feats: **{' | '.join(feat_names)}**")
         if completed_dt is not None:
             description_lines.append(f"<t:{int(completed_dt.timestamp())}:R>")
 
@@ -995,6 +1084,7 @@ class TeamRaidTracker:
                 )
                 if completion is None:
                     continue
+                completion["feat_names"] = await self._resolve_feat_names_from_pgcr(pgcr)
                 await self._enrich_players_with_profile_class(completion)
 
                 # Keep the instance id from activity history for consistency.
